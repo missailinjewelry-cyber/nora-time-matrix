@@ -1,31 +1,13 @@
+
 """Матриця часу Nora.
-Матриця створює часову сітку. Вона не прогнозує напрямок руху.
-Усі часові розрахунки виконує Python, не ШІ.
+Порожній часовий календар для аналізу мікровимірів.
 """
 
 import os
 from datetime import datetime, timedelta, timezone
-
-try:
-    from zoneinfo import ZoneInfo
-
-    timezone_name = os.getenv("PLATFORM_TIMEZONE", "").strip()
-
-    if timezone_name:
-        TZ = ZoneInfo(timezone_name)
-        TZ_LABEL = timezone_name
-    else:
-        offset = float(os.getenv("PLATFORM_UTC_OFFSET", "3"))
-        TZ = timezone(timedelta(hours=offset))
-        TZ_LABEL = f"UTC{offset:+g}"
-
-except Exception:
-    offset = 3.0
-    TZ = timezone(timedelta(hours=offset))
-    TZ_LABEL = f"UTC{offset:+g}"
+from zoneinfo import ZoneInfo
 
 
-# Усі масштаби, які використовує Nora
 TIMEFRAMES = [
     ("M1", 1),
     ("M2", 2),
@@ -40,12 +22,25 @@ TIMEFRAMES = [
 
 
 def now_platform():
-    """Поточний час у часовій зоні торгової платформи."""
-    return datetime.now(TZ)
+    """Час платформи: Київ + 1 година."""
+
+    utc_now = datetime.now(timezone.utc)
+
+    # Можна задати точний UTC-зсув платформи через Railway.
+    manual_offset = os.getenv("PLATFORM_UTC_OFFSET", "").strip()
+
+    if manual_offset:
+        offset = float(manual_offset)
+    else:
+        kyiv_now = utc_now.astimezone(ZoneInfo("Europe/Kyiv"))
+        offset = kyiv_now.utcoffset().total_seconds() / 3600 + 1
+
+    platform_tz = timezone(timedelta(hours=offset))
+
+    return utc_now.astimezone(platform_tz)
 
 
 def format_duration(seconds):
-    """Зручне відображення тривалості."""
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -57,9 +52,10 @@ def format_duration(seconds):
 
 
 def timeframe_state(now, name, minutes):
-    """Положення поточної свічки в одному часовому масштабі."""
+    """Поточне положення свічки в конкретному масштабі."""
 
     total_minutes = now.hour * 60 + now.minute
+
     elapsed = (total_minutes % minutes) * 60 + now.second
     remaining = minutes * 60 - elapsed
 
@@ -84,38 +80,34 @@ def timeframe_state(now, name, minutes):
 
 
 def matrix_snapshot(now=None):
-    """
-    Створює поточний часовий зріз усіх таймфреймів.
-    Не містить прогнозу напрямку.
-    """
+    """Створює часовий зріз усіх дев'яти масштабів."""
 
     now = now or now_platform()
 
     lines = [
         "МАТРИЦЯ ЧАСУ NORA",
-        f"Час платформи: {now:%Y-%m-%d %H:%M:%S}",
-        f"Часова зона: {TZ_LABEL}",
+        f"ЧАС ПЛАТФОРМИ: {now:%Y-%m-%d %H:%M:%S}",
+        f"UTC ЗСУВ: {now.strftime('%z')}",
         "",
-        "ПОТОЧНЕ ПОЛОЖЕННЯ СВІЧОК:",
+        "ПОТОЧНІ МІКРОВИМІРИ:",
     ]
 
     for name, minutes in TIMEFRAMES:
         state = timeframe_state(now, name, minutes)
 
         lines.append(
-            f"{name}: відкрилася {state['opened_at']} | "
-            f"закриється {state['closes_at']} | "
+            f"{name}: відкриття {state['opened_at']} | "
+            f"закриття {state['closes_at']} | "
             f"минуло {format_duration(state['elapsed_seconds'])} | "
-            f"залишилося {format_duration(state['remaining_seconds'])} | "
+            f"залишилось {format_duration(state['remaining_seconds'])} | "
             f"заповнення {state['progress_percent']}%"
         )
 
     lines.extend([
         "",
-        "ВАЖЛИВО:",
-        "Це лише часова структура.",
-        "Вона не визначає напрямок, розворот або продовження руху.",
-        "Для цього потрібен аналіз скриншотів графіка.",
+        "Матриця показує тільки часові координати.",
+        "Вона не визначає напрямок руху.",
+        "H4 у цій версії прив'язана до 00:00 часу платформи.",
     ])
 
     return "\n".join(lines)
@@ -124,13 +116,10 @@ def matrix_snapshot(now=None):
 def upcoming_junctions(
     now=None,
     horizon_min=60,
-    min_timeframes=3,
+    min_timeframes=2,
     limit=15
 ):
-    """
-    Знаходить майбутні хвилини, у які закриваються
-    щонайменше min_timeframes свічок одночасно.
-    """
+    """Знаходить майбутні збіги закриття свічок."""
 
     now = now or now_platform()
     base = now.replace(second=0, microsecond=0)
@@ -161,19 +150,19 @@ def upcoming_junctions(
 
     if not rows:
         return (
-            f"У наступні {horizon_min} хвилин "
-            f"немає стиків із {min_timeframes}+ таймфреймів."
+            f"У наступні {horizon_min} хв "
+            "не знайдено часових стиків."
         )
 
     return (
         "МАЙБУТНІ ЧАСОВІ СТИКИ:\n"
         + "\n".join(rows)
-        + "\n\nСтик — це часова подія, а не торговий сигнал."
+        + "\nСтик — часова подія, не торговий сигнал."
     )
 
 
 def full_matrix(now=None):
-    """Повна матриця для передачі ШІ."""
+    """Повна часова структура для передачі Nora."""
 
     now = now or now_platform()
 
