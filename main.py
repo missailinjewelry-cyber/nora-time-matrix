@@ -4,6 +4,7 @@ import base64
 import logging
 import asyncio
 
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -12,9 +13,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import OpenAI
 
-# Ключі доступу з Railway
+# ---------- НАЛАШТУВАННЯ ----------
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -23,139 +24,252 @@ if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger("Nora")
 
 MAX_IMAGES = 5
+ALBUM_WAIT = 2.0
+
+# Тимчасове збирання фотографій одного альбому
+ALBUMS = {}
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["chart_history"] = []
+# ---------- ІНСТРУКЦІЯ ДЛЯ ШІ ----------
 
-    await update.message.reply_text(
-        "Привіт! Я Nora ❤️\n\n"
-        "Я пам'ятаю до п'яти останніх скриншотів "
-        "і порівнюю їх як єдиний рух.\n\n"
-        "Надсилай скриншоти послідовно.\n"
-        "Команда /reset очищує пам'ять графіка."
-    )
+SYSTEM_PROMPT = """
+Ти Nora — аналітична помічниця користувачки.
+Твоя мета — аналізувати графік як єдину мультитаймфреймову структуру.
+
+КОРИСТУВАЧКА НАДСИЛАЄ 3-5 ОКРЕМИХ СКРИНШОТІВ
+ОДНІЄЇ ВАЛЮТНОЇ ПАРИ.
+
+ВАЖЛИВО:
+1. Розглядай усі скриншоти разом, як різні масштаби
+одного руху, а не як послідовні моменти часу.
+2. Визначай таймфрейм кожного скриншота за підписом,
+якщо він видимий. Не вигадуй його, якщо не видно.
+3. Перевіряй, чи однакова валютна пара на всіх скриншотах.
+Якщо пари різні — не давай торгового сигналу.
+4. Аналізуй напрямок, швидкість, розмір тіл і хвостів,
+ритм, структуру та стадію руху.
+5. Визначай характер графіка: пружина, шум, затор
+або змішаний стан.
+6. Шукай взаємодію молодших і старших таймфреймів.
+7. Не вигадуй ціни, таймфрейми та події, яких не видно.
+8. Якщо даних недостатньо або графік неадекватний
+для входу — чесно обирай WAIT.
+9. Не сприймай закриття таймфрейму як автоматичний
+сигнал для входу.
+10. Не обіцяй результату угоди.
+
+Відповідай українською, стисло, до 180 слів.
+
+ФОРМАТ:
+
+ПАРА:
+ТАЙМФРЕЙМИ:
+ЄДИНА СТРУКТУРА РУХУ:
+ХАРАКТЕР ГРАФІКА:
+НАПРЯМОК:
+ЩО ПІДТВЕРДЖУЄ РУХ:
+ЩО МОЖЕ ЙОГО ЗЛАМАТИ:
+ВЕРДИКТ: CALL / PUT / WAIT
+ЕКСПІРАЦІЯ: поки не визначена — не вигадуй.
+"""
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["chart_history"] = []
+# ---------- АНАЛІЗ ЗОБРАЖЕНЬ ----------
 
-    await update.message.reply_text(
-        "Пам'ять графіка очищена ❤️\n"
-        "Можемо починати новий аналіз."
-    )
-
-
-def analyze_images(history):
+def analyze_images(images):
     content = [
         {
             "type": "input_text",
             "text": (
-                "Ти Nora — аналітична помічниця користувача.\n"
-                "Перед тобою послідовність скриншотів одного графіка "
-                "у хронологічному порядку.\n\n"
-
-                "ГОЛОВНЕ:\n"
-                "Не аналізуй кожен скриншот окремо. "
-                "Розглядай усі зображення як розвиток одного руху. "
-                "Порівнюй попередній стан із наступним. "
-                "Відстежуй напрямок, швидкість, тіла та хвости свічок, "
-                "зміни сили руху та можливі переходи між стадіями.\n\n"
-
-                "Не вигадуй ціни, часові інтервали чи події, "
-                "яких не видно. Якщо скриншоти не дозволяють "
-                "надійно порівняти рух, скажи про це.\n\n"
-
-                "ВІДПОВІДАЙ УКРАЇНСЬКОЮ.\n"
-                "Максимум 120 слів. Без довгих вступів "
-                "і повторів очевидного.\n\n"
-
-                "ФОРМАТ ВІДПОВІДІ:\n"
-                "1. Загальний рух — коротко.\n"
-                "2. Що змінилося між скриншотами.\n"
-                "3. Поточна стадія руху.\n"
-                "4. Що спостерігати далі.\n"
-                "5. Висновок: CALL / PUT / WAIT та причина.\n\n"
-
-                "Це поки базовий аналіз послідовності, "
-                "а не повна Матриця часу. "
-                "Не подавай сигнал як гарантію результату."
-            )
+                "Проаналізуй цей пакет скриншотів як одну "
+                "мультитаймфреймову структуру руху. "
+                "Усі зображення належать одному пакету. "
+                "Порядок їх надсилання не означає, що це "
+                "послідовні моменти руху."
+            ),
         }
     ]
 
-    for index, image_bytes in enumerate(history, start=1):
-        encoded = base64.b64encode(image_bytes).decode("utf-8")
+    for index, image_bytes in enumerate(images, start=1):
+        encoded = base64.b64encode(image_bytes).decode("ascii")
 
         content.append({
             "type": "input_text",
-            "text": f"Скриншот {index} у хронологічному порядку:"
+            "text": f"Скриншот {index}:",
         })
 
         content.append({
             "type": "input_image",
-            "image_url": f"data:image/jpeg;base64,{encoded}"
+            "image_url": f"data:image/jpeg;base64,{encoded}",
         })
 
     response = client.responses.create(
         model="gpt-4.1-mini",
+        instructions=SYSTEM_PROMPT,
         input=[
             {
                 "role": "user",
-                "content": content
+                "content": content,
             }
         ],
-        max_output_tokens=300
+        max_output_tokens=500,
     )
 
     return response.output_text
 
 
-async def analyze_chart(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.message
+# ---------- ЗАВАНТАЖЕННЯ ФОТО ----------
 
-    history = context.user_data.setdefault("chart_history", [])
+async def download_images(messages, context):
+    images = []
 
-    await message.reply_text("Отримала скриншот. Аналізую рух... 🔎")
-
-    try:
+    for message in messages:
         photo = message.photo[-1]
-
         telegram_file = await context.bot.get_file(photo.file_id)
 
         image_bytes = bytes(
             await telegram_file.download_as_bytearray()
         )
 
-        history.append(image_bytes)
+        images.append(image_bytes)
 
-        if len(history) > MAX_IMAGES:
-            del history[0]
+    return images
+
+
+# ---------- СПІЛЬНИЙ АНАЛІЗ ПАКЕТА ----------
+
+async def process_album(messages, context):
+    messages.sort(key=lambda item: item.message_id)
+
+    if not 1 <= len(messages) <= MAX_IMAGES:
+        await messages[0].reply_text(
+            "Я можу проаналізувати від 1 до 5 скриншотів "
+            "за один раз. Надішли пакет ще раз."
+        )
+        return
+
+    status = await messages[0].reply_text(
+        f"Отримала {len(messages)} скриншотів. "
+        "Об'єдную їх в одну структуру руху... 🔎"
+    )
+
+    try:
+        images = await download_images(messages, context)
 
         result = await asyncio.to_thread(
             analyze_images,
-            history.copy()
+            images,
         )
 
-        await message.reply_text(
-            f"У пам'яті: {len(history)} скриншотів.\n\n{result}"
+        await status.edit_text(
+            f"ПАКЕТ: {len(images)} скриншотів\n\n{result}"
         )
 
     except Exception:
-        logger.exception("Помилка аналізу графіка")
+        logger.exception("Помилка аналізу пакета")
 
-        await message.reply_text(
-            "Не вдалося проаналізувати графік. "
-            "Спробуй надіслати скриншот ще раз."
+        await status.edit_text(
+            "Не вдалося проаналізувати пакет. "
+            "Спробуй надіслати скриншоти ще раз."
         )
 
+
+# ---------- ЗБИРАННЯ АЛЬБОМУ TELEGRAM ----------
+
+async def flush_album(key, context):
+    try:
+        await asyncio.sleep(ALBUM_WAIT)
+
+        album = ALBUMS.pop(key, None)
+
+        if not album:
+            return
+
+        messages = album["messages"]
+
+        await process_album(messages, context)
+
+    except asyncio.CancelledError:
+        pass
+
+    except Exception:
+        logger.exception("Помилка збирання альбому")
+
+
+async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    if not message or not message.photo:
+        return
+
+    # Одиночне фото
+    if not message.media_group_id:
+        await process_album([message], context)
+        return
+
+    # Ключ альбому: чат + ID групи
+    key = (message.chat_id, message.media_group_id)
+
+    if key not in ALBUMS:
+        ALBUMS[key] = {
+            "messages": [],
+            "task": None,
+        }
+
+    album = ALBUMS[key]
+    album["messages"].append(message)
+
+    # Кожне нове фото продовжує очікування
+    if album["task"] and not album["task"].done():
+        album["task"].cancel()
+
+    album["task"] = asyncio.create_task(
+        flush_album(key, context)
+    )
+
+
+# ---------- КОМАНДИ ----------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привіт! Я Nora ❤️\n\n"
+        "Надсилай мені 3–5 скриншотів однієї валютної пари "
+        "одним пакетом.\n\n"
+        "Я об'єднаю різні таймфрейми та проаналізую "
+        "їх як одну структуру руху.\n\n"
+        "Команда /reset очищує незавершені пакети."
+    )
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    keys = [
+        key for key in ALBUMS
+        if key[0] == chat_id
+    ]
+
+    for key in keys:
+        album = ALBUMS.pop(key, None)
+
+        if album and album["task"]:
+            album["task"].cancel()
+
+    await update.message.reply_text(
+        "Незавершені пакети очищено ❤️\n"
+        "Можемо починати новий аналіз."
+    )
+
+
+# ---------- ЗАПУСК ----------
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -164,10 +278,10 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
 
     app.add_handler(
-        MessageHandler(filters.PHOTO, analyze_chart)
+        MessageHandler(filters.PHOTO, receive_photo)
     )
 
-    print("Nora запущена!")
+    logger.info("Nora запущена!")
 
     app.run_polling()
 
