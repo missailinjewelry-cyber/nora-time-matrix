@@ -1,173 +1,490 @@
+import os
+import base64
+import logging
+import asyncio
+import re
 
-"""Матриця часу Nora.
-Порожній часовий календар для аналізу мікровимірів.
+from openai import OpenAI
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from matrix import full_matrix, now_platform
+
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+    raise RuntimeError("Не задані ключі Telegram або OpenAI")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+MODEL = "gpt-4.1-mini"
+MAX_IMAGES = 5
+ALBUM_WAIT = 3.0
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+
+logger = logging.getLogger("Nora")
+
+ALBUMS = {}
+
+
+SYSTEM_PROMPT = """
+Ти Nora — аналітична помічниця користувача.
+Твоя основа — авторська система «Матриця часу».
+
+ГОЛОВНА ІДЕЯ:
+
+Різні таймфрейми — це різні мікровиміри одного руху.
+Матриця часу об'єднує їх в одне ціле.
+
+Матриця часу — це порожній календар.
+Вона сама не прогнозує напрямок і не створює сигнал.
+
+Скриншоти заповнюють календар ринковою інформацією:
+цінами, рівнями, розмірами тіл свічок, хвостами,
+швидкістю, ритмом і стадіями мікроруху.
+
+Твоє завдання — побачити цілісну картину:
+що відбувається між мікровимірами,
+куди може спрямуватися рух,
+коли можливий поштовх
+і скільки часу йому може знадобитися.
+
+ПАКЕТ СКРИНШОТІВ:
+
+Усі зображення одного пакета мають показувати
+один валютний інструмент і різні таймфрейми.
+
+Це не послідовні кадри в часі.
+Не сприймай їх як рух ціни від першого зображення до останнього.
+
+Визначай таймфрейм лише за видимими позначеннями.
+Не вигадуй відсутні таймфрейми.
+Якщо на скриншотах різні валютні пари —
+не об'єднуй їх і видай WAIT.
+
+АНАЛІЗ:
+
+Оціни спільно:
+- напрямок і структуру руху;
+- рівні та реакцію ціни на них;
+- розмір тіл свічок і хвостів;
+- швидкість, ритм, прискорення та уповільнення;
+- взаємодію різних таймфреймів;
+- пружину — стиснення перед можливим рухом;
+- шум — хаотичний рух без зрозумілої структури;
+- затор — боротьбу без упевненого продовження.
+
+Не приписуй ринку намірів.
+Не стверджуй, що покупці чи продавці виснажені,
+якщо це не підтверджено видимою структурою.
+
+МАТРИЦЯ ЧАСУ:
+
+Тобі передаються розрахунки Python:
+час платформи, положення свічок,
+час до їх закриття та майбутні часові стики.
+
+Не перераховуй ці значення самостійно.
+Використовуй їх як часову координатну сітку.
+
+Часовий стик — це не автоматичний сигнал.
+Він не означає обов'язкового розвороту чи продовження.
+Його значення визначається лише разом із картиною графіка.
+
+Час матриці — це час обробки пакета,
+а не гарантований час створення скриншотів.
+Якщо на зображенні видно інший час,
+врахуй можливу різницю.
+
+УВАГА ЩОДО H4:
+
+Межі H4 у поточній матриці умовно прив'язані
+до 00:00 часу платформи.
+Якщо межі свічок на скриншоті не збігаються,
+не використовуй розрахований час H4 як точний.
+
+ВХІД І ЕКСПІРАЦІЯ:
+
+Це два різні рішення.
+
+1. ВХІД:
+Визнач, чи варто входити зараз,
+чи краще зачекати орієнтовно певну кількість хвилин
+або конкретну умову на графіку.
+
+2. ЕКСПІРАЦІЯ:
+Визнач, скільки хвилин після фактичного входу
+може розвиватися саме цей рух.
+
+Допустима експірація — від 1 до 60 хвилин включно.
+
+Не прив'язуй експірацію до таймфрейму.
+Не використовуй постійні 3 хвилини.
+Не обирай час лише через наближення часового стику.
+
+Оцінюй тривалість за характером руху,
+його стадією, швидкістю та взаємодією масштабів.
+
+Якщо рух потребує часу для формування —
+не поспішай із входом.
+Якщо поштовх уже формується —
+оцінюй, чи є підстави для входу зараз.
+
+Не вигадуй точний час входу.
+«Через N хв» — лише орієнтовна оцінка,
+а не гарантія.
+
+Якщо експірацію неможливо обґрунтувати,
+видай WAIT і напиши «не визначена».
+
+Не плутай, наприклад:
+«чекати 2 хвилини до входу»
+та
+«експірація 7 хвилин після входу».
+
+ВЕРДИКТ:
+
+CALL — є достатні підстави очікувати рух угору.
+PUT — є достатні підстави очікувати рух униз.
+WAIT — ситуація нечітка, суперечлива
+або немає обґрунтованого входу й експірації.
+
+Не намагайся обов'язково видати сигнал.
+Не обіцяй прибуток.
+
+ФОРМАТ ВІДПОВІДІ:
+
+Пара: ...
+Картина: ... (коротко, суть усіх мікровимірів)
+Напрямок: CALL / PUT / WAIT
+Вхід: зараз / орієнтовно через N хв / чекати умову
+Експірація: N хв після входу / не визначена
+Причина: ... (одне коротке пояснення)
+
+Не додавай довгих переліків і повторів.
+Відповідай українською.
 """
 
-import os
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
+def validate_analysis(result):
+    """Перевіряє вердикт та експірацію."""
 
-TIMEFRAMES = [
-    ("M1", 1),
-    ("M2", 2),
-    ("M3", 3),
-    ("M5", 5),
-    ("M10", 10),
-    ("M15", 15),
-    ("M30", 30),
-    ("H1", 60),
-    ("H4", 240),
-]
+    lines = result.strip().splitlines()
 
+    direction = None
+    expiry = None
+    expiry_line_index = None
 
-def now_platform():
-    """Час платформи: Київ + 1 година."""
+    for index, line in enumerate(lines):
+        if line.lower().startswith("напрямок:"):
+            value = line.split(":", 1)[1].strip().upper()
+            if value in ("CALL", "PUT", "WAIT"):
+                direction = value
 
-    utc_now = datetime.now(timezone.utc)
+        if line.lower().startswith("експірація:"):
+            expiry_line_index = index
+            value = line.split(":", 1)[1].strip().lower()
 
-    # Можна задати точний UTC-зсув платформи через Railway.
-    manual_offset = os.getenv("PLATFORM_UTC_OFFSET", "").strip()
+            if "не визначена" in value:
+                expiry = None
+            else:
+                match = re.search(r"\b(\d{1,2})\s*хв\b", value)
+                if match:
+                    minutes = int(match.group(1))
+                    if 1 <= minutes <= 60:
+                        expiry = minutes
 
-    if manual_offset:
-        offset = float(manual_offset)
-    else:
-        kyiv_now = utc_now.astimezone(ZoneInfo("Europe/Kyiv"))
-        offset = kyiv_now.utcoffset().total_seconds() / 3600 + 1
+    if direction not in ("CALL", "PUT", "WAIT"):
+        direction = "WAIT"
 
-    platform_tz = timezone(timedelta(hours=offset))
+    # Без обґрунтованої експірації не залишаємо CALL або PUT.
+    if direction in ("CALL", "PUT") and expiry is None:
+        direction = "WAIT"
 
-    return utc_now.astimezone(platform_tz)
+    # WAIT не повинен містити торгову експірацію.
+    if direction == "WAIT":
+        expiry = None
 
-
-def format_duration(seconds):
-    seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    if hours:
-        return f"{hours}г {minutes:02d}хв {seconds:02d}с"
-
-    return f"{minutes}хв {seconds:02d}с"
-
-
-def timeframe_state(now, name, minutes):
-    """Поточне положення свічки в конкретному масштабі."""
-
-    total_minutes = now.hour * 60 + now.minute
-
-    elapsed = (total_minutes % minutes) * 60 + now.second
-    remaining = minutes * 60 - elapsed
-
-    candle_open = (
-        now.replace(second=0, microsecond=0)
-        - timedelta(seconds=elapsed)
-    )
-
-    candle_close = candle_open + timedelta(minutes=minutes)
-
-    progress = elapsed / (minutes * 60) * 100
-
-    return {
-        "timeframe": name,
-        "minutes": minutes,
-        "opened_at": candle_open.strftime("%H:%M:%S"),
-        "closes_at": candle_close.strftime("%H:%M:%S"),
-        "elapsed_seconds": elapsed,
-        "remaining_seconds": remaining,
-        "progress_percent": round(progress, 1),
-    }
-
-
-def matrix_snapshot(now=None):
-    """Створює часовий зріз усіх дев'яти масштабів."""
-
-    now = now or now_platform()
-
-    lines = [
-        "МАТРИЦЯ ЧАСУ NORA",
-        f"ЧАС ПЛАТФОРМИ: {now:%Y-%m-%d %H:%M:%S}",
-        f"UTC ЗСУВ: {now.strftime('%z')}",
-        "",
-        "ПОТОЧНІ МІКРОВИМІРИ:",
-    ]
-
-    for name, minutes in TIMEFRAMES:
-        state = timeframe_state(now, name, minutes)
-
-        lines.append(
-            f"{name}: відкриття {state['opened_at']} | "
-            f"закриття {state['closes_at']} | "
-            f"минуло {format_duration(state['elapsed_seconds'])} | "
-            f"залишилось {format_duration(state['remaining_seconds'])} | "
-            f"заповнення {state['progress_percent']}%"
+    if expiry_line_index is not None:
+        lines[expiry_line_index] = (
+            f"Експірація: {expiry} хв після входу"
+            if expiry is not None
+            else "Експірація: не визначена"
         )
 
-    lines.extend([
-        "",
-        "Матриця показує тільки часові координати.",
-        "Вона не визначає напрямок руху.",
-        "H4 у цій версії прив'язана до 00:00 часу платформи.",
-    ])
+    direction_found = False
+
+    for index, line in enumerate(lines):
+        if line.lower().startswith("напрямок:"):
+            lines[index] = f"Напрямок: {direction}"
+            direction_found = True
+            break
+
+    if not direction_found:
+        lines.insert(0, f"Напрямок: {direction}")
+
+    if expiry_line_index is None:
+        lines.append(
+            f"Експірація: {expiry} хв після входу"
+            if expiry is not None
+            else "Експірація: не визначена"
+        )
+
+    if direction == "WAIT":
+        for index, line in enumerate(lines):
+            if line.lower().startswith("вхід:"):
+                lines[index] = "Вхід: не входити"
+                break
 
     return "\n".join(lines)
 
 
-def upcoming_junctions(
-    now=None,
-    horizon_min=60,
-    min_timeframes=2,
-    limit=15
-):
-    """Знаходить майбутні збіги закриття свічок."""
-
-    now = now or now_platform()
-    base = now.replace(second=0, microsecond=0)
-
-    rows = []
-
-    for step in range(1, horizon_min + 1):
-        moment = base + timedelta(minutes=step)
-        total_minutes = moment.hour * 60 + moment.minute
-
-        closing = [
-            name
-            for name, minutes in TIMEFRAMES
-            if total_minutes % minutes == 0
-        ]
-
-        if len(closing) >= min_timeframes:
-            seconds_until = int((moment - now).total_seconds())
-
-            rows.append(
-                f"{moment:%H:%M:%S} "
-                f"(через {format_duration(seconds_until)}): "
-                f"{', '.join(closing)}"
+def analyze_images(images, matrix_text):
+    content = [
+        {
+            "type": "input_text",
+            "text": (
+                "Проаналізуй усі зображення як одну структуру "
+                "різних мікровимірів одного графіка.\n\n"
+                "ЧАСОВА МАТРИЦЯ:\n"
+                + matrix_text
+                + "\n\n"
+                "Дотримуйся короткого формату відповіді. "
+                "Окремо визнач момент входу та експірацію "
+                "від 1 до 60 хвилин після фактичного входу."
             )
+        }
+    ]
 
-        if len(rows) >= limit:
-            break
+    for index, image_bytes in enumerate(images, start=1):
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
 
-    if not rows:
-        return (
-            f"У наступні {horizon_min} хв "
-            "не знайдено часових стиків."
+        content.append({
+            "type": "input_text",
+            "text": (
+                f"Скриншот {index}: окремий часовий масштаб "
+                "того самого графіка, не наступний кадр."
+            )
+        })
+
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:image/jpeg;base64,{encoded}"
+        })
+
+    response = client.responses.create(
+        model=MODEL,
+        instructions=SYSTEM_PROMPT,
+        input=[
+            {
+                "role": "user",
+                "content": content
+            }
+        ],
+        max_output_tokens=350
+    )
+
+    return validate_analysis(response.output_text)
+
+
+async def download_images(messages, context):
+    images = []
+
+    for message in messages:
+        if not message.photo:
+            continue
+
+        photo = message.photo[-1]
+        telegram_file = await context.bot.get_file(photo.file_id)
+
+        image_bytes = bytes(
+            await telegram_file.download_as_bytearray()
         )
 
-    return (
-        "МАЙБУТНІ ЧАСОВІ СТИКИ:\n"
-        + "\n".join(rows)
-        + "\nСтик — часова подія, не торговий сигнал."
+        images.append(image_bytes)
+
+    return images
+
+
+async def process_album(messages, context):
+    if not messages:
+        return
+
+    messages.sort(key=lambda message: message.message_id)
+    messages = messages[:MAX_IMAGES]
+
+    status = await messages[0].reply_text(
+        f"Отримала {len(messages)} скриншотів.\n"
+        "Об'єдную мікровиміри та матрицю часу..."
+    )
+
+    try:
+        images = await download_images(messages, context)
+
+        if not images:
+            await status.edit_text("Не вдалося отримати зображення.")
+            return
+
+        analysis_time = now_platform()
+        matrix_text = full_matrix(analysis_time)
+
+        logger.info(
+            "Пакет отримано: %s зображень",
+            len(images)
+        )
+
+        result = await asyncio.to_thread(
+            analyze_images,
+            images,
+            matrix_text
+        )
+
+        final_text = (
+            f"{result}\n\n"
+            f"Час платформи: {analysis_time:%H:%M:%S}"
+        )
+
+        await status.edit_text(final_text)
+
+    except Exception:
+        logger.exception("Помилка аналізу пакета")
+        await status.edit_text(
+            "Не вдалося завершити аналіз.\n"
+            "Спробуй надіслати пакет ще раз."
+        )
+
+
+async def flush_album(key, context):
+    try:
+        await asyncio.sleep(ALBUM_WAIT)
+
+        album = ALBUMS.pop(key, None)
+
+        if album:
+            await process_album(album["messages"], context)
+
+    except asyncio.CancelledError:
+        pass
+
+    except Exception:
+        logger.exception("Помилка обробки альбому")
+
+
+async def receive_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.message
+
+    if not message:
+        return
+
+    media_group_id = message.media_group_id
+
+    if not media_group_id:
+        await process_album([message], context)
+        return
+
+    key = (message.chat_id, media_group_id)
+
+    if key not in ALBUMS:
+        ALBUMS[key] = {
+            "messages": [],
+            "task": None
+        }
+
+    album = ALBUMS[key]
+    album["messages"].append(message)
+
+    old_task = album.get("task")
+
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    album["task"] = asyncio.create_task(
+        flush_album(key, context)
     )
 
 
-def full_matrix(now=None):
-    """Повна часова структура для передачі Nora."""
-
-    now = now or now_platform()
-
-    return (
-        matrix_snapshot(now)
-        + "\n\n"
-        + upcoming_junctions(now)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привіт! Я Nora.\n\n"
+        "Я об'єдную різні таймфрейми в одну картину "
+        "за допомогою Матриці часу.\n\n"
+        "Надсилай 3–5 скриншотів одного валютного інструмента "
+        "одним альбомом.\n\n"
+        "Я визначатиму напрямок, момент входу "
+        "та можливу експірацію від 1 до 60 хвилин.\n\n"
+        "Команда /time показує поточну матрицю."
     )
+
+
+async def time_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        analysis_time = now_platform()
+        matrix_text = full_matrix(analysis_time)
+
+        await update.message.reply_text(matrix_text)
+
+    except Exception:
+        logger.exception("Помилка матриці часу")
+        await update.message.reply_text(
+            "Не вдалося побудувати матрицю часу."
+        )
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    keys = [
+        key for key in ALBUMS
+        if key[0] == chat_id
+    ]
+
+    for key in keys:
+        album = ALBUMS.pop(key, None)
+
+        if album and album.get("task"):
+            album["task"].cancel()
+
+    await update.message.reply_text(
+        "Незавершені пакети очищені."
+    )
+
+
+def main():
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("time", time_command))
+    app.add_handler(CommandHandler("reset", reset))
+
+    app.add_handler(
+        MessageHandler(filters.PHOTO, receive_photo)
+    )
+
+    logger.info("Nora запущена!")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
