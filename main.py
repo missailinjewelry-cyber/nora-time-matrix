@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
+# Ключі доступу з Railway
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -33,10 +34,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Привіт! Я Nora ❤️\n\n"
-        "Тепер я можу пам'ятати до п'яти останніх скриншотів "
-        "у межах однієї сесії та порівнювати їх між собою.\n\n"
+        "Я пам'ятаю до п'яти останніх скриншотів "
+        "і порівнюю їх як єдиний рух.\n\n"
         "Надсилай скриншоти послідовно.\n"
-        "Команда /reset починає новий аналіз."
+        "Команда /reset очищує пам'ять графіка."
     )
 
 
@@ -45,7 +46,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Пам'ять графіка очищена ❤️\n"
-        "Можемо починати нову сесію."
+        "Можемо починати новий аналіз."
     )
 
 
@@ -54,27 +55,35 @@ def analyze_images(history):
         {
             "type": "input_text",
             "text": (
-                "Ти Nora — помічниця з аналізу графіків.\n"
-                "Перед тобою послідовність скриншотів одного графіка, "
-                "надісланих у хронологічному порядку.\n\n"
-                "ВАЖЛИВО:\n"
-                "1. Не аналізуй останній скриншот ізольовано.\n"
-                "2. Порівняй усі зображення між собою.\n"
-                "3. Визнач, що змінилося від першого до останнього.\n"
-                "4. Відстежуй напрямок, швидкість, тіла та хвости свічок.\n"
-                "5. Відокремлюй видимі факти від припущень.\n"
-                "6. Не вигадуй часові інтервали й ціни.\n\n"
-                "Поки що це базовий аналіз послідовності, "
-                "а не повна Матриця часу.\n\n"
-                "Дай відповідь українською у форматі:\n"
-                "• Загальна картина руху\n"
-                "• Як змінювався рух між скриншотами\n"
-                "• Поточний напрямок і швидкість\n"
-                "• Що може відбутися далі\n"
-                "• Попередній висновок: CALL / PUT / WAIT\n"
-                "• Що потрібно побачити для підтвердження\n\n"
-                "Не обіцяй прибутку. Якщо даних недостатньо, "
-                "чесно скажи про це."
+                "Ти Nora — аналітична помічниця користувача.\n"
+                "Перед тобою послідовність скриншотів одного графіка "
+                "у хронологічному порядку.\n\n"
+
+                "ГОЛОВНЕ:\n"
+                "Не аналізуй кожен скриншот окремо. "
+                "Розглядай усі зображення як розвиток одного руху. "
+                "Порівнюй попередній стан із наступним. "
+                "Відстежуй напрямок, швидкість, тіла та хвости свічок, "
+                "зміни сили руху та можливі переходи між стадіями.\n\n"
+
+                "Не вигадуй ціни, часові інтервали чи події, "
+                "яких не видно. Якщо скриншоти не дозволяють "
+                "надійно порівняти рух, скажи про це.\n\n"
+
+                "ВІДПОВІДАЙ УКРАЇНСЬКОЮ.\n"
+                "Максимум 120 слів. Без довгих вступів "
+                "і повторів очевидного.\n\n"
+
+                "ФОРМАТ ВІДПОВІДІ:\n"
+                "1. Загальний рух — коротко.\n"
+                "2. Що змінилося між скриншотами.\n"
+                "3. Поточна стадія руху.\n"
+                "4. Що спостерігати далі.\n"
+                "5. Висновок: CALL / PUT / WAIT та причина.\n\n"
+
+                "Це поки базовий аналіз послідовності, "
+                "а не повна Матриця часу. "
+                "Не подавай сигнал як гарантію результату."
             )
         }
     ]
@@ -84,7 +93,7 @@ def analyze_images(history):
 
         content.append({
             "type": "input_text",
-            "text": f"Скриншот номер {index} у хронологічній послідовності:"
+            "text": f"Скриншот {index} у хронологічному порядку:"
         })
 
         content.append({
@@ -94,10 +103,13 @@ def analyze_images(history):
 
     response = client.responses.create(
         model="gpt-4.1-mini",
-        input=[{
-            "role": "user",
-            "content": content
-        }]
+        input=[
+            {
+                "role": "user",
+                "content": content
+            }
+        ],
+        max_output_tokens=300
     )
 
     return response.output_text
@@ -111,14 +123,13 @@ async def analyze_chart(
 
     history = context.user_data.setdefault("chart_history", [])
 
-    await message.reply_text(
-        f"Отримала скриншот. Усього в пам'яті буде до "
-        f"{MAX_IMAGES} зображень. Аналізую послідовність... 🔎"
-    )
+    await message.reply_text("Отримала скриншот. Аналізую рух... 🔎")
 
     try:
         photo = message.photo[-1]
+
         telegram_file = await context.bot.get_file(photo.file_id)
+
         image_bytes = bytes(
             await telegram_file.download_as_bytearray()
         )
@@ -134,15 +145,15 @@ async def analyze_chart(
         )
 
         await message.reply_text(
-            f"Скриншотів у поточній пам'яті: {len(history)}\n\n"
-            f"{result}"
+            f"У пам'яті: {len(history)} скриншотів.\n\n{result}"
         )
 
     except Exception:
-        logger.exception("Помилка аналізу")
+        logger.exception("Помилка аналізу графіка")
+
         await message.reply_text(
             "Не вдалося проаналізувати графік. "
-            "Спробуй ще раз."
+            "Спробуй надіслати скриншот ще раз."
         )
 
 
@@ -151,11 +162,13 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+
     app.add_handler(
         MessageHandler(filters.PHOTO, analyze_chart)
     )
 
     print("Nora запущена!")
+
     app.run_polling()
 
 
