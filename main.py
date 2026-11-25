@@ -1,8 +1,8 @@
-
 import os
 import base64
 import logging
 import asyncio
+import math
 import re
 import sqlite3
 
@@ -32,10 +32,18 @@ if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-MODEL = "gpt-4.1-mini"
+# Модель можна змінити у Railway Variables (OPENAI_MODEL), наприклад gpt-4.1
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 MAX_IMAGES = 5
 ALBUM_WAIT = 3.0
-DB_PATH = "/data/nora.db"
+MAX_OUTPUT_TOKENS = 600
+DB_PATH = os.getenv("DB_PATH", "/data/nora.db")
+
+# Виплата брокера для статистики (поріг окупності = 1 / (1 + виплата)).
+try:
+    PAYOUT = float(os.getenv("PAYOUT", "0.85"))
+except ValueError:
+    PAYOUT = 0.85
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,14 +80,16 @@ SYSTEM_PROMPT = """
 Часовий стик не є автоматичним сигналом.
 Не перераховуй час матриці самостійно.
 
-H4 у поточній матриці умовно прив'язана до 00:00
-часу платформи. Якщо межі не збігаються,
-не використовуй розрахунок H4 як точний.
+H4 у матриці прив'язана до 01:00 часу платформи:
+свічки H4 відкриваються о 01, 05, 09, 13, 17, 21.
 
 Окремо визнач:
 1. Момент входу: зараз, орієнтовно через N хв
    або чекати конкретну умову.
 2. Експірацію: від 1 до 60 хвилин ПІСЛЯ фактичного входу.
+
+Вхід має бути ОДНИМ: або «зараз», або одна конкретна умова.
+Не пиши «або ... або» у полі Вхід.
 
 Не прив'язуй експірацію до таймфрейму.
 Не використовуй постійні 3 хвилини.
@@ -94,7 +104,7 @@ WAIT — немає достатніх підстав для входу.
 Відповідай коротко, українською.
 Не обіцяй прибуток.
 
-ФОРМАТ:
+ФОРМАТ (кожне поле з нового рядка, без жирного шрифту):
 
 Пара: ...
 Картина: ...
@@ -105,12 +115,16 @@ WAIT — немає достатніх підстав для входу.
 """
 
 
+# ---------- База даних ----------
+
 def db_connect():
     return sqlite3.connect(DB_PATH)
 
 
 def init_db():
-    os.makedirs("/data", exist_ok=True)
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
 
     with db_connect() as db:
         db.execute("""
@@ -138,69 +152,120 @@ def init_db():
             )
         """)
 
+        # Нові стовпці для вже існуючої бази: сира відповідь моделі
+        # і хвилина платформи (для перевірки календаря хвилин).
+        for column, kind in (
+            ("raw_text", "TEXT"),
+            ("platform_minute", "INTEGER"),
+        ):
+            try:
+                db.execute(
+                    f"ALTER TABLE predictions ADD COLUMN {column} {kind}"
+                )
+            except sqlite3.OperationalError:
+                pass  # стовпець уже існує
+
     logger.info("База даних Nora готова: %s", DB_PATH)
+
+
+# ---------- Розбір відповіді моделі ----------
+
+FIELD_PATTERN = r"^[\s>*_#\-•]*{field}[\s*_]*:[\s*_]*(.*)$"
 
 
 def get_field(text, field):
     match = re.search(
-        rf"^{re.escape(field)}:\s*(.+)$",
+        FIELD_PATTERN.format(field=re.escape(field)),
         text,
         re.IGNORECASE | re.MULTILINE
     )
-    return match.group(1).strip() if match else ""
+    return match.group(1).strip(" *_") if match else ""
 
 
-def validate_analysis(result):
-    lines = result.strip().splitlines()
+def parse_direction(text):
+    """CALL / PUT / WAIT. Якщо не вдалося визначити однозначно — WAIT."""
+    value = get_field(text, "Напрямок").upper()
+    found = set(re.findall(r"\b(CALL|PUT|WAIT)\b", value))
 
-    direction = get_field(result, "Напрямок").upper()
-    if direction not in ("CALL", "PUT", "WAIT"):
-        direction = "WAIT"
+    if len(found) == 1:
+        return found.pop()
 
-    expiry_text = get_field(result, "Експірація").lower()
-    match = re.search(r"(\d{1,2})\s*хв", expiry_text)
+    return "WAIT"
 
-    expiry = None
+
+def parse_expiry(text):
+    value = get_field(text, "Експірація").lower()
+    match = re.search(r"(\d{1,2})\s*хв", value)
+
     if match:
         number = int(match.group(1))
         if 1 <= number <= 60:
-            expiry = number
+            return number
+
+    return None
+
+
+LINE_PATTERN = re.compile(
+    r"^[\s>*_#\-•]*(напрямок|експірація|вхід)[\s*_]*:",
+    re.IGNORECASE
+)
+
+
+def validate_analysis(result):
+    direction = parse_direction(result)
+    expiry = parse_expiry(result)
 
     if direction in ("CALL", "PUT") and expiry is None:
         direction = "WAIT"
 
-    output = []
+    if direction == "WAIT":
+        expiry = None
 
-    for line in lines:
-        if line.lower().startswith("напрямок:"):
+    expiry_line = (
+        f"Експірація: {expiry} хв після входу"
+        if expiry else "Експірація: не визначена"
+    )
+
+    output = []
+    seen = set()
+
+    for line in result.strip().splitlines():
+        match = LINE_PATTERN.match(line)
+
+        if not match:
+            output.append(line)
+            continue
+
+        key = match.group(1).lower()
+        seen.add(key)
+
+        if key == "напрямок":
             output.append(f"Напрямок: {direction}")
-        elif line.lower().startswith("експірація:"):
-            if expiry:
-                output.append(
-                    f"Експірація: {expiry} хв після входу"
-                )
-            else:
-                output.append("Експірація: не визначена")
-        elif line.lower().startswith("вхід:") and direction == "WAIT":
+        elif key == "експірація":
+            output.append(expiry_line)
+        elif direction == "WAIT":
             output.append("Вхід: не входити")
         else:
-            output.append(line)
+            output.append(line.strip())
 
-    if not any(x.lower().startswith("напрямок:") for x in output):
+    if "напрямок" not in seen:
         output.append(f"Напрямок: {direction}")
 
-    if not any(x.lower().startswith("експірація:") for x in output):
-        output.append(
-            f"Експірація: {expiry} хв після входу"
-            if expiry else "Експірація: не визначена"
-        )
+    if "експірація" not in seen:
+        output.append(expiry_line)
 
-    if direction == "WAIT" and not any(
-        x.lower().startswith("вхід:") for x in output
-    ):
+    if direction == "WAIT" and "вхід" not in seen:
         output.append("Вхід: не входити")
 
     return "\n".join(output)
+
+
+# ---------- Аналіз ----------
+
+def image_mime(image_bytes):
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return "image/jpeg"
 
 
 def analyze_images(images, matrix_text):
@@ -224,36 +289,43 @@ def analyze_images(images, matrix_text):
 
         content.append({
             "type": "input_image",
-            "image_url": f"data:image/jpeg;base64,{encoded}"
+            "image_url": f"data:{image_mime(image_bytes)};base64,{encoded}",
+            "detail": "high"
         })
 
     response = client.responses.create(
         model=MODEL,
         instructions=SYSTEM_PROMPT,
         input=[{"role": "user", "content": content}],
-        max_output_tokens=250
+        max_output_tokens=MAX_OUTPUT_TOKENS
     )
 
-    return validate_analysis(response.output_text)
+    raw = response.output_text or ""
+    validated = validate_analysis(raw)
+
+    if getattr(response, "status", None) == "incomplete":
+        validated += (
+            "\n\nВідповідь обірвалась, висновок міг бути неповним."
+        )
+
+    return validated, raw
 
 
-def save_prediction(analysis, images, platform_time):
+def save_prediction(analysis, raw, images, platform_time):
     pair = get_field(analysis, "Пара")
-    direction = get_field(analysis, "Напрямок").upper()
+    direction = parse_direction(analysis)
     entry = get_field(analysis, "Вхід")
-    expiry_text = get_field(analysis, "Експірація")
-
-    match = re.search(r"(\d{1,2})\s*хв", expiry_text)
-    expiry = int(match.group(1)) if match else None
+    expiry = parse_expiry(analysis)
 
     with db_connect() as db:
         cursor = db.execute("""
             INSERT INTO predictions (
                 created_at, platform_time, pair, direction,
                 entry, expiry_minutes, analysis,
-                screenshot_count, outcome
+                screenshot_count, outcome,
+                raw_text, platform_minute
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         """, (
             platform_time.isoformat(),
             platform_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -262,7 +334,9 @@ def save_prediction(analysis, images, platform_time):
             entry,
             expiry,
             analysis,
-            len(images)
+            len(images),
+            raw,
+            platform_time.minute
         ))
 
         prediction_id = cursor.lastrowid
@@ -277,6 +351,8 @@ def save_prediction(analysis, images, platform_time):
 
     return prediction_id
 
+
+# ---------- Кнопки результату ----------
 
 def result_keyboard(prediction_id, direction):
     if direction == "WAIT":
@@ -312,8 +388,9 @@ async def handle_result(
     context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    await query.answer()
 
+    # На callback можна відповісти лише один раз, тому відповідаємо
+    # в кінці кожної гілки.
     try:
         _, prediction_id, outcome = query.data.split(":")
         prediction_id = int(prediction_id)
@@ -322,6 +399,7 @@ async def handle_result(
         return
 
     if outcome not in ("win", "loss", "skip"):
+        await query.answer()
         return
 
     with db_connect() as db:
@@ -336,6 +414,8 @@ async def handle_result(
     if not changed:
         await query.answer("Цей прогноз уже зафіксований.")
         return
+
+    await query.answer()
 
     labels = {
         "win": "ПЛЮС",
@@ -352,15 +432,26 @@ async def handle_result(
     )
 
 
+# ---------- Прийом скрінів ----------
+
 async def download_images(messages, context):
     images = []
 
     for message in messages:
-        if not message.photo:
+        file_id = None
+
+        if message.photo:
+            file_id = message.photo[-1].file_id
+        elif (
+            message.document
+            and (message.document.mime_type or "").startswith("image/")
+        ):
+            file_id = message.document.file_id
+
+        if not file_id:
             continue
 
-        photo = message.photo[-1]
-        telegram_file = await context.bot.get_file(photo.file_id)
+        telegram_file = await context.bot.get_file(file_id)
 
         image_bytes = bytes(
             await telegram_file.download_as_bytearray()
@@ -393,7 +484,7 @@ async def process_album(messages, context):
         analysis_time = now_platform()
         matrix_text = full_matrix(analysis_time)
 
-        result = await asyncio.to_thread(
+        result, raw = await asyncio.to_thread(
             analyze_images,
             images,
             matrix_text
@@ -402,11 +493,12 @@ async def process_album(messages, context):
         prediction_id = await asyncio.to_thread(
             save_prediction,
             result,
+            raw,
             images,
             analysis_time
         )
 
-        direction = get_field(result, "Напрямок").upper()
+        direction = parse_direction(result)
 
         keyboard = result_keyboard(prediction_id, direction)
 
@@ -482,6 +574,8 @@ async def receive_photo(
     )
 
 
+# ---------- Команди ----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привіт! Я Nora.\n\n"
@@ -510,10 +604,19 @@ async def time_command(
         )
 
 
-async def stats_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def minute_label(minute):
+    if minute == 0:
+        return ":00 (усі ТФ)"
+
+    closed = [
+        f"M{p}" for p in (2, 3, 5, 10, 15, 30)
+        if minute % p == 0
+    ]
+
+    return "+".join(closed) if closed else "лише M1"
+
+
+def build_stats_text():
     with db_connect() as db:
         total = db.execute(
             "SELECT COUNT(*) FROM predictions"
@@ -532,6 +635,13 @@ async def stats_command(
             ORDER BY direction, outcome
         """).fetchall()
 
+        minutes = db.execute("""
+            SELECT platform_minute, outcome
+            FROM predictions
+            WHERE platform_minute IS NOT NULL
+              AND outcome IN ('win', 'loss')
+        """).fetchall()
+
     counts = {
         "win": 0,
         "loss": 0,
@@ -543,10 +653,7 @@ async def stats_command(
         counts[outcome] = count
 
     completed = counts["win"] + counts["loss"]
-    accuracy = (
-        counts["win"] / completed * 100
-        if completed else 0
-    )
+    breakeven = 1 / (1 + PAYOUT) * 100
 
     text = (
         "СТАТИСТИКА NORA\n\n"
@@ -555,10 +662,35 @@ async def stats_command(
         f"Мінусів: {counts['loss']}\n"
         f"Пропущено: {counts['skip']}\n"
         f"Очікують результату: {counts['pending']}\n\n"
-        f"Точність серед угод із результатом: "
-        f"{accuracy:.1f}%\n"
-        f"Враховано угод: {completed}\n"
     )
+
+    if completed:
+        accuracy = counts["win"] / completed * 100
+        margin = 1.96 * math.sqrt(
+            (accuracy / 100) * (1 - accuracy / 100) / completed
+        ) * 100
+
+        text += (
+            f"Точність серед угод із результатом: {accuracy:.1f}% "
+            f"(±{margin:.0f} п.п.)\n"
+            f"Враховано угод: {completed}\n"
+            f"Поріг окупності при виплаті {PAYOUT * 100:.0f}%: "
+            f"{breakeven:.1f}%\n"
+        )
+
+        if completed < 30:
+            text += (
+                f"Висновок: замало угод ({completed} з 30), "
+                "робити висновки рано.\n"
+            )
+        elif accuracy - margin > breakeven:
+            text += "Висновок: є ознаки переваги.\n"
+        elif accuracy + margin < breakeven:
+            text += "Висновок: нижче порогу окупності.\n"
+        else:
+            text += "Висновок: не відрізнити від випадковості.\n"
+    else:
+        text += "Угод із результатом ще немає.\n"
 
     if directions:
         text += "\nЗА НАПРЯМКАМИ:\n"
@@ -566,7 +698,29 @@ async def stats_command(
         for direction, outcome, count in directions:
             text += f"{direction} — {outcome}: {count}\n"
 
-    await update.message.reply_text(text)
+    if minutes:
+        groups = {}
+
+        for minute, outcome in minutes:
+            wins, total_g = groups.get(minute_label(minute), (0, 0))
+            groups[minute_label(minute)] = (
+                wins + (1 if outcome == "win" else 0),
+                total_g + 1
+            )
+
+        text += "\nЗА ХВИЛИНОЮ (потрібні десятки угод):\n"
+
+        for label, (wins, total_g) in sorted(groups.items()):
+            text += f"{label}: {wins} з {total_g}\n"
+
+    return text
+
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    await update.message.reply_text(build_stats_text())
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -590,6 +744,7 @@ def main():
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)
         .build()
     )
 
@@ -606,7 +761,10 @@ def main():
     )
 
     app.add_handler(
-        MessageHandler(filters.PHOTO, receive_photo)
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE,
+            receive_photo
+        )
     )
 
     logger.info("Nora запущена!")
