@@ -1,9 +1,9 @@
-
 """Матриця часу Nora.
 Порожній часовий календар для аналізу мікровимірів.
 """
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -20,18 +20,32 @@ TIMEFRAMES = [
     ("H4", 240),
 ]
 
+# Година (за часом платформи), з якої стартує перша свічка H4 за добу.
+# За таймерами платформи (UTC+3): 01, 05, 09, 13, 17, 21.
+try:
+    H4_ANCHOR_HOUR = int(os.getenv("H4_ANCHOR_HOUR", "1").strip())
+except ValueError:
+    H4_ANCHOR_HOUR = 1
+
+
+def _parse_offset(text):
+    """Приймає «3», «+3», «UTC+3», «3.5». Повертає None, якщо не вдалося."""
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text or "")
+    return float(match.group(0)) if match else None
+
 
 def now_platform():
-    """Час платформи: Київ + 1 година."""
+    """Час платформи.
+
+    Краще задати PLATFORM_UTC_OFFSET у Railway (наприклад, 3).
+    Якщо змінної немає: Київ + 1 година.
+    """
 
     utc_now = datetime.now(timezone.utc)
 
-    # Можна задати точний UTC-зсув платформи через Railway.
-    manual_offset = os.getenv("PLATFORM_UTC_OFFSET", "").strip()
+    offset = _parse_offset(os.getenv("PLATFORM_UTC_OFFSET", ""))
 
-    if manual_offset:
-        offset = float(manual_offset)
-    else:
+    if offset is None:
         kyiv_now = utc_now.astimezone(ZoneInfo("Europe/Kyiv"))
         offset = kyiv_now.utcoffset().total_seconds() / 3600 + 1
 
@@ -51,19 +65,22 @@ def format_duration(seconds):
     return f"{minutes}хв {seconds:02d}с"
 
 
+def _shift_minutes(minutes):
+    """Зсув сітки: H4 стартує не з 00:00, а з H4_ANCHOR_HOUR."""
+    return H4_ANCHOR_HOUR * 60 if minutes == 240 else 0
+
+
 def timeframe_state(now, name, minutes):
     """Поточне положення свічки в конкретному масштабі."""
 
-    total_minutes = now.hour * 60 + now.minute
+    now = now.replace(microsecond=0)
+    total_minutes = now.hour * 60 + now.minute - _shift_minutes(minutes)
 
     elapsed = (total_minutes % minutes) * 60 + now.second
     remaining = minutes * 60 - elapsed
 
-    candle_open = (
-        now.replace(second=0, microsecond=0)
-        - timedelta(seconds=elapsed)
-    )
-
+    # Секунди вже входять в elapsed, тому replace(second=0) тут не потрібен.
+    candle_open = now - timedelta(seconds=elapsed)
     candle_close = candle_open + timedelta(minutes=minutes)
 
     progress = elapsed / (minutes * 60) * 100
@@ -77,6 +94,19 @@ def timeframe_state(now, name, minutes):
         "remaining_seconds": remaining,
         "progress_percent": round(progress, 1),
     }
+
+
+def minute_composition(now):
+    """Склад хвилини: цілі свічки + хвіст для M2-M30."""
+
+    parts = []
+    for name, minutes in TIMEFRAMES:
+        if name in ("M1", "H1", "H4"):
+            continue
+        q, r = divmod(now.minute, minutes)
+        parts.append(f"{name} {q}+{r}м")
+
+    return f"Склад хвилини :{now.minute:02d}: " + ", ".join(parts)
 
 
 def matrix_snapshot(now=None):
@@ -105,9 +135,12 @@ def matrix_snapshot(now=None):
 
     lines.extend([
         "",
+        minute_composition(now),
+        "",
         "Матриця показує тільки часові координати.",
         "Вона не визначає напрямок руху.",
-        "H4 у цій версії прив'язана до 00:00 часу платформи.",
+        f"H4 прив'язана до {H4_ANCHOR_HOUR:02d}:00 часу платформи "
+        "(свічки H4 відкриваються кожні 4 години від цієї години).",
     ])
 
     return "\n".join(lines)
@@ -116,10 +149,13 @@ def matrix_snapshot(now=None):
 def upcoming_junctions(
     now=None,
     horizon_min=60,
-    min_timeframes=2,
-    limit=15
+    min_timeframes=3,
+    limit=10
 ):
-    """Знаходить майбутні збіги закриття свічок."""
+    """Знаходить майбутні збіги закриття свічок.
+
+    M1 не рахується: вона закривається щохвилини і створювала б шум.
+    """
 
     now = now or now_platform()
     base = now.replace(second=0, microsecond=0)
@@ -128,12 +164,13 @@ def upcoming_junctions(
 
     for step in range(1, horizon_min + 1):
         moment = base + timedelta(minutes=step)
-        total_minutes = moment.hour * 60 + moment.minute
+        total = moment.hour * 60 + moment.minute
 
         closing = [
             name
             for name, minutes in TIMEFRAMES
-            if total_minutes % minutes == 0
+            if name != "M1"
+            and (total - _shift_minutes(minutes)) % minutes == 0
         ]
 
         if len(closing) >= min_timeframes:
@@ -151,11 +188,11 @@ def upcoming_junctions(
     if not rows:
         return (
             f"У наступні {horizon_min} хв "
-            "не знайдено часових стиків."
+            "не знайдено значних часових стиків."
         )
 
     return (
-        "МАЙБУТНІ ЧАСОВІ СТИКИ:\n"
+        "МАЙБУТНІ ЧАСОВІ СТИКИ (3+ таймфрейми без M1):\n"
         + "\n".join(rows)
         + "\nСтик — часова подія, не торговий сигнал."
     )
