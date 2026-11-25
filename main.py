@@ -1,8 +1,8 @@
+
 import os
 import base64
 import logging
 import asyncio
-import math
 import re
 import sqlite3
 
@@ -21,8 +21,14 @@ from telegram.ext import (
     filters,
 )
 
-from matrix import full_matrix, now_platform
+from matrix import (
+    full_matrix,
+    now_platform,
+    H4_ANCHOR_HOUR,
+)
 
+
+# ---------- Налаштування ----------
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -32,18 +38,11 @@ if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Модель можна змінити у Railway Variables (OPENAI_MODEL), наприклад gpt-4.1
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 MAX_IMAGES = 5
-ALBUM_WAIT = 3.0
-MAX_OUTPUT_TOKENS = 750
+ALBUM_WAIT = 2.5
+MAX_OUTPUT_TOKENS = 950
 DB_PATH = os.getenv("DB_PATH", "/data/nora.db")
-
-# Виплата брокера для статистики (поріг окупності = 1 / (1 + виплата)).
-try:
-    PAYOUT = float(os.getenv("PAYOUT", "0.85"))
-except ValueError:
-    PAYOUT = 0.85
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,79 +53,151 @@ logger = logging.getLogger("Nora")
 ALBUMS = {}
 
 
-SYSTEM_PROMPT = """
+# ---------- Аналітична логіка Nora ----------
+
+SYSTEM_PROMPT = f"""
 Ти Nora — аналітична помічниця користувача.
 Твоя основа — авторська система «Матриця часу».
 
+ГОЛОВНИЙ ПРИНЦИП:
 Різні таймфрейми — різні мікровиміри одного руху.
-Матриця часу — порожній календар, який сам не прогнозує напрямок.
-Скриншоти заповнюють його цінами, рівнями, тілами,
+Матриця часу об'єднує ці масштаби в одну часову структуру.
+Матриця — порожній календар. Вона сама не визначає напрямок.
+Скриншоти заповнюють календар цінами, рівнями, тілами,
 хвостами, швидкістю, ритмом і стадіями руху.
 
-Аналізуй усі скриншоти як одну структуру одного інструмента.
-Це різні масштаби приблизно одного моменту, не послідовні кадри.
-Не вигадуй відсутні таймфрейми.
-Якщо пари різні — видай WAIT.
+УСІ СКРИНШОТИ:
+- Аналізуй їх як одну структуру одного інструмента.
+- Це різні масштаби приблизно одного моменту, не послідовні кадри.
+- Не вважай порядок надсилання послідовністю руху.
+- Визначай таймфрейм тільки за видимими позначками.
+- Не вигадуй відсутні таймфрейми, ціни або рівні.
+- Якщо пари на скриншотах різні або це неможливо перевірити,
+  обирай WAIT.
+
+ПОСЛІДОВНІСТЬ АНАЛІЗУ:
+
+1. СПОЧАТКУ ВИЗНАЧ СТРУКТУРУ:
+- продовження руху;
+- розворот;
+- корекція;
+- накопичення / стискання;
+- затор;
+- пружина;
+- шум;
+- змішана структура;
+- недостатньо даних.
+
+Не називай пружиною будь-який довгий хвіст.
+Не називай розворотом будь-який відскок.
+Шукай підтвердження в декількох масштабах.
+
+2. ПРОЧИТАЙ ВЗАЄМОДІЮ МІКРОВИМІРІВ:
+- де рух прискорюється або сповільнюється;
+- де свічки стискаються або розширюються;
+- як співвідносяться тіла та хвости;
+- чи є реакція на рівень;
+- чи підтримують нижчі масштаби старші;
+- чи суперечать масштаби один одному;
+- на якій стадії перебуває рух.
+
+Не вигадуй причину руху, якщо її не видно.
+
+3. ВИЗНАЧ СЦЕНАРІЙ:
+Оціни, що ймовірніше:
+- продовження;
+- зміна напрямку;
+- відкат;
+- боковий рух;
+- невизначеність.
+
+Відокремлюй те, що вже видно, від того, що лише очікується.
+
+4. ПРОГНОЗ ПОШТОВХУ:
+Визнач:
+- можливий напрямок;
+- що має статися перед поштовхом;
+- коли орієнтовно може з'явитися імпульс;
+- яка умова скасує сценарій.
+
+Не вигадуй точну хвилину, якщо її неможливо обґрунтувати.
+Часовий стик матриці — лише часова подія.
+Він не означає автоматичного розвороту чи продовження.
+
+5. ВХІД:
+Обери тільки один варіант:
+- ЗАРАЗ;
+- ЧЕРЕЗ N ХВИЛИН;
+- ПІСЛЯ УМОВИ: конкретна видима умова;
+- НЕ ВХОДИТИ.
+
+Не пиши кілька альтернатив в одному полі.
+Не вигадуй точний час входу.
+
+6. ЕКСПІРАЦІЯ:
+Визнач окремо від напрямку та входу.
+Експірація — це тривалість після фактичного входу.
+Діапазон — від 1 до 60 хвилин.
+
+НЕ використовуй формулу:
+кількість свічок одного таймфрейму × його тривалість.
+
+НЕ прив'язуй експірацію автоматично до таймфрейму.
+НЕ використовуй постійні 3 або 15 хвилин.
+НЕ обирай експірацію лише через часовий стик.
 
 Оціни:
-- напрямок і структуру;
-- рівні та реакцію ціни;
-- тіла свічок і хвости;
-- швидкість, ритм, прискорення та уповільнення;
-- взаємодію масштабів;
-- пружину, шум і затор.
+- очікуваний шлях руху;
+- стадію формування імпульсу;
+- швидкість і ритм;
+- опірні та підтримувальні рівні на шляху;
+- взаємодію швидких і повільних масштабів;
+- скільки часу може знадобитися саме цьому сценарію;
+- чи не завершиться очікуваний рух раніше за експірацію.
 
-Матриця — тільки часова координатна сітка.
-Часовий стик не є автоматичним сигналом.
-Не перераховуй час матриці самостійно.
+Вибери одне обґрунтоване число від 1 до 60.
+Якщо неможливо обґрунтувати тривалість — WAIT.
+Не підганяй число під бажаний результат.
 
-H4 у матриці прив'язана до 01:00 часу платформи:
-свічки H4 відкриваються о 01, 05, 09, 13, 17, 21.
+7. ПЕРЕВІРКА:
+Якщо напрямок суперечливий, вхід не має підтвердження,
+скриншотів недостатньо або експірація не обґрунтована —
+обирай WAIT.
 
-Окремо визнач:
-1. Момент входу: зараз, орієнтовно через N хв
-   або чекати конкретну умову.
-   Вхід має бути ОДНИМ: або «зараз», або одна конкретна умова.
-   Не пиши «або ... або» у полі Вхід.
-   Не вигадуй точний час входу.
-
-2. ЕКСПІРАЦІЯ (1–60 хв після входу):
-   - Визнач робочий масштаб ідеї: на якому таймфреймі видно сценарій.
-   - Оціни, скільки свічок цього масштабу потрібно, щоб сценарій
-     розвинувся (1–3), щоб підсумок не перевищував 60 хв.
-   - Порахуй базу: кількість свічок × тривалість свічки в хвилинах
-     (у межах 1–60 хв).
-   - Якщо вхід «зараз» і поруч із моментом завершення є стик матриці,
-     можна підсунути кінець до нього, але не більше ніж на 2 хв
-     (не виходячи за 1–60 хв).
-   - 15 за замовчуванням не використовуй; якщо вагаєшся — обери менше.
-
-Не використовуй постійні 3 хвилини.
-Не обирай експірацію лише через часовий стик.
-Якщо немає обґрунтованого рішення — WAIT.
-
-CALL — можливий рух угору.
-PUT — можливий рух униз.
-WAIT — немає достатніх підстав для входу.
-
-Відповідай коротко, українською.
+Не вигадуй відсоток точності.
 Не обіцяй прибуток.
+Не видавай припущення за факт.
 
-ФОРМАТ (кожне поле з нового рядка, без жирного шрифту):
+H4 у матриці починається о {H4_ANCHOR_HOUR:02d}:00
+за часом платформи. Реальне вирівнювання H4 у брокера
+може відрізнятися — враховуй це обмеження.
+
+ВІДПОВІДЬ КОРОТКА. Українською.
+Кожне поле з нового рядка. Без довгих вступів.
+
+ФОРМАТ:
 
 Пара: ...
-Картина: ...
+Структура: ...
+Стадія руху: ...
+Взаємодія масштабів: ...
+Сценарій: ...
 Напрямок: CALL / PUT / WAIT
+Поштовх: ...
 Вхід: ...
 Експірація: N хв після входу / не визначена
-Причина: ... (тут же одним коротким реченням поясни, чому саме N)
+Скасування сценарію: ...
+Причина експірації: ...
+Причина рішення: ...
 """
 
 
 # ---------- База даних ----------
 
 def db_connect():
-    return sqlite3.connect(DB_PATH, timeout=15.0)
+    db = sqlite3.connect(DB_PATH, timeout=20)
+    db.execute("PRAGMA foreign_keys = ON")
+    return db
 
 
 def init_db():
@@ -160,25 +231,33 @@ def init_db():
             )
         """)
 
-        # Нові стовпці для вже існуючої бази: сира відповідь моделі
-        # і хвилина платформи (для перевірки календаря хвилин).
-        for column, kind in (
-            ("raw_text", "TEXT"),
-            ("platform_minute", "INTEGER"),
-        ):
-            try:
+        # Безпечне доповнення вже наявної бази.
+        existing = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(predictions)"
+            ).fetchall()
+        }
+
+        additions = {
+            "raw_text": "TEXT",
+            "platform_minute": "INTEGER",
+        }
+
+        for column, kind in additions.items():
+            if column not in existing:
                 db.execute(
                     f"ALTER TABLE predictions ADD COLUMN {column} {kind}"
                 )
-            except sqlite3.OperationalError:
-                pass  # стовпець уже існує
 
-    logger.info("База даних Nora готова: %s", DB_PATH)
+    logger.info("База Nora готова: %s", DB_PATH)
 
 
-# ---------- Розбір відповіді моделі ----------
+# ---------- Розбір прогнозу ----------
 
-FIELD_PATTERN = r"^[\s>*_#\-•]*{field}[\s*_]*:[\s*_]*(.*)$"
+FIELD_PATTERN = (
+    r"^[\s>*_#\-•]*{field}[\s*_]*:[\s*_]*(.*)$"
+)
 
 
 def get_field(text, field):
@@ -191,7 +270,6 @@ def get_field(text, field):
 
 
 def parse_direction(text):
-    """CALL / PUT / WAIT. Якщо не вдалося визначити однозначно — WAIT."""
     value = get_field(text, "Напрямок").upper()
     found = set(re.findall(r"\b(CALL|PUT|WAIT)\b", value))
 
@@ -203,72 +281,74 @@ def parse_direction(text):
 
 def parse_expiry(text):
     value = get_field(text, "Експірація").lower()
-    match = re.search(r"(\d{1,2})\s*хв", value)
+    match = re.search(r"\b(\d{1,2})\s*хв", value)
 
-    if match:
-        number = int(match.group(1))
-        if 1 <= number <= 60:
-            return number
+    if not match:
+        return None
 
-    return None
-
-
-LINE_PATTERN = re.compile(
-    r"^[\s>*_#\-•]*(напрямок|експірація|вхід)[\s*_]*:",
-    re.IGNORECASE
-)
+    number = int(match.group(1))
+    return number if 1 <= number <= 60 else None
 
 
 def validate_analysis(result):
     direction = parse_direction(result)
     expiry = parse_expiry(result)
 
+    # Для CALL/PUT обов'язкова експірація 1–60 хв.
     if direction in ("CALL", "PUT") and expiry is None:
         direction = "WAIT"
 
     if direction == "WAIT":
         expiry = None
 
-    expiry_line = (
-        f"Експірація: {expiry} хв після входу"
-        if expiry else "Експірація: не визначена"
-    )
+    replacements = {
+        "Напрямок": (
+            f"Напрямок: {direction}"
+        ),
+        "Експірація": (
+            f"Експірація: {expiry} хв після входу"
+            if expiry
+            else "Експірація: не визначена"
+        ),
+    }
 
-    output = []
-    seen = set()
+    lines = []
+    found = set()
 
     for line in result.strip().splitlines():
-        match = LINE_PATTERN.match(line)
+        match = re.match(
+            r"^[\s>*_#\-•]*(Напрямок|Експірація)\s*:",
+            line,
+            re.IGNORECASE
+        )
 
-        if not match:
-            output.append(line)
-            continue
-
-        key = match.group(1).lower()
-        seen.add(key)
-
-        if key == "напрямок":
-            output.append(f"Напрямок: {direction}")
-        elif key == "експірація":
-            output.append(expiry_line)
-        elif direction == "WAIT":
-            output.append("Вхід: не входити")
+        if match:
+            key = match.group(1).capitalize()
+            found.add(key)
+            lines.append(replacements[key])
         else:
-            output.append(line.strip())
+            lines.append(line)
 
-    if "напрямок" not in seen:
-        output.append(f"Напрямок: {direction}")
+    for key, value in replacements.items():
+        if key not in found:
+            lines.append(value)
 
-    if "експірація" not in seen:
-        output.append(expiry_line)
+    if direction == "WAIT":
+        entry_line = get_field("\n".join(lines), "Вхід")
+        if entry_line and entry_line.lower() not in (
+            "не входити", "wait", "не визначено"
+        ):
+            lines = [
+                "Вхід: не входити" if re.match(
+                    r"^\s*Вхід\s*:", line, re.IGNORECASE
+                ) else line
+                for line in lines
+            ]
 
-    if direction == "WAIT" and "вхід" not in seen:
-        output.append("Вхід: не входити")
-
-    return "\n".join(output)
+    return "\n".join(lines)
 
 
-# ---------- Аналіз ----------
+# ---------- Аналіз зображень ----------
 
 def image_mime(image_bytes):
     if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
@@ -280,8 +360,9 @@ def analyze_images(images, matrix_text):
     content = [{
         "type": "input_text",
         "text": (
-            "Проаналізуй усі скриншоти як одну структуру "
-            "різних мікровимірів одного графіка.\n\n"
+            "Проаналізуй цей пакет скриншотів за інструкцією Nora.\n"
+            "Це один інструмент і приблизно один момент часу.\n"
+            "Не сприймай скриншоти як послідовність кадрів.\n\n"
             "ЧАСОВА МАТРИЦЯ:\n"
             + matrix_text
         )
@@ -292,32 +373,46 @@ def analyze_images(images, matrix_text):
 
         content.append({
             "type": "input_text",
-            "text": f"Скриншот {index}: окремий часовий масштаб."
+            "text": (
+                f"Зображення {index}. "
+                "Визнач масштаб за видимою позначкою."
+            )
         })
 
         content.append({
             "type": "input_image",
-            "image_url": f"data:{image_mime(image_bytes)};base64,{encoded}",
+            "image_url": (
+                f"data:{image_mime(image_bytes)};base64,{encoded}"
+            ),
             "detail": "high"
         })
 
     response = client.responses.create(
         model=MODEL,
         instructions=SYSTEM_PROMPT,
-        input=[{"role": "user", "content": content}],
+        input=[{
+            "role": "user",
+            "content": content
+        }],
         max_output_tokens=MAX_OUTPUT_TOKENS
     )
 
     raw = response.output_text or ""
+
+    if not raw.strip():
+        raise RuntimeError("Модель повернула порожню відповідь")
+
     validated = validate_analysis(raw)
 
     if getattr(response, "status", None) == "incomplete":
         validated += (
-            "\n\nВідповідь обірвалась, висновок міг бути неповним."
+            "\n\nУВАГА: відповідь моделі була обірвана."
         )
 
     return validated, raw
 
+
+# ---------- Збереження прогнозу ----------
 
 def save_prediction(analysis, raw, images, platform_time):
     pair = get_field(analysis, "Пара")
@@ -355,7 +450,10 @@ def save_prediction(analysis, raw, images, platform_time):
                     prediction_id, image_data
                 )
                 VALUES (?, ?)
-            """, (prediction_id, sqlite3.Binary(image_bytes)))
+            """, (
+                prediction_id,
+                sqlite3.Binary(image_bytes)
+            ))
 
     return prediction_id
 
@@ -391,14 +489,9 @@ def result_keyboard(prediction_id, direction):
     ])
 
 
-async def handle_result(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def handle_result(update, context):
     query = update.callback_query
 
-    # На callback можна відповісти лише один раз, тому відповідаємо
-    # в кінці кожної гілки.
     try:
         _, prediction_id, outcome = query.data.split(":")
         prediction_id = int(prediction_id)
@@ -407,7 +500,7 @@ async def handle_result(
         return
 
     if outcome not in ("win", "loss", "skip"):
-        await query.answer()
+        await query.answer("Невідомий результат.")
         return
 
     with db_connect() as db:
@@ -423,24 +516,91 @@ async def handle_result(
         await query.answer("Цей прогноз уже зафіксований.")
         return
 
-    await query.answer()
+    await query.answer("Результат збережено.")
 
     labels = {
         "win": "ПЛЮС",
         "loss": "МІНУС",
-        "skip": "ПРОПУЩЕНО"
+        "skip": "ПРОПУЩЕНО",
     }
 
     old_text = query.message.text or ""
-    new_text = old_text + f"\n\nРезультат: {labels[outcome]}"
-
     await query.edit_message_text(
-        new_text,
+        old_text + f"\n\nРезультат: {labels[outcome]}",
         reply_markup=None
     )
 
 
-# ---------- Прийом скрінів ----------
+# ---------- Статистика ----------
+
+async def stats_command(update, context):
+    with db_connect() as db:
+        rows = db.execute("""
+            SELECT outcome, COUNT(*)
+            FROM predictions
+            GROUP BY outcome
+        """).fetchall()
+
+        directions = db.execute("""
+            SELECT direction, outcome, COUNT(*)
+            FROM predictions
+            GROUP BY direction, outcome
+            ORDER BY direction, outcome
+        """).fetchall()
+
+    counts = dict(rows)
+    wins = counts.get("win", 0)
+    losses = counts.get("loss", 0)
+    skipped = counts.get("skip", 0)
+    pending = counts.get("pending", 0)
+
+    total = sum(counts.values())
+    completed = wins + losses
+    accuracy = (
+        wins / completed * 100
+        if completed else 0
+    )
+
+    lines = [
+        "СТАТИСТИКА NORA",
+        "",
+        f"Усього прогнозів: {total}",
+        f"Плюсів: {wins}",
+        f"Мінусів: {losses}",
+        f"Пропущено: {skipped}",
+        f"Очікують результату: {pending}",
+        "",
+        f"Точність серед угод із результатом: {accuracy:.1f}%",
+        f"Враховано угод: {completed}",
+        "",
+        "ЗА НАПРЯМКАМИ:",
+    ]
+
+    for direction, outcome, count in directions:
+        lines.append(f"{direction} — {outcome}: {count}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------- Часова матриця ----------
+
+async def time_command(update, context):
+    now = now_platform()
+    await update.message.reply_text(full_matrix(now))
+
+
+async def start_command(update, context):
+    await update.message.reply_text(
+        "Я Nora — аналізую графік через Матрицю часу.\n\n"
+        "Надішли 3–5 скриншотів однієї валютної пари "
+        "одним пакетом.\n\n"
+        "Команди:\n"
+        "/time — часова матриця\n"
+        "/stats — статистика прогнозів"
+    )
+
+
+# ---------- Прийом скриншотів ----------
 
 async def download_images(messages, context):
     images = []
@@ -460,11 +620,9 @@ async def download_images(messages, context):
             continue
 
         telegram_file = await context.bot.get_file(file_id)
-
         image_bytes = bytes(
             await telegram_file.download_as_bytearray()
         )
-
         images.append(image_bytes)
 
     return images
@@ -478,15 +636,17 @@ async def process_album(messages, context):
     messages = messages[:MAX_IMAGES]
 
     status = await messages[0].reply_text(
-        f"Отримала {len(messages)} скриншотів.\n"
-        "Об'єдную мікровиміри та матрицю часу..."
+        f"Отримала пакет. Скриншотів: {len(messages)}.\n"
+        "Об'єдную мікровиміри та Матрицю часу..."
     )
 
     try:
         images = await download_images(messages, context)
 
         if not images:
-            await status.edit_text("Не вдалося отримати зображення.")
+            await status.edit_text(
+                "Не вдалося отримати зображення."
+            )
             return
 
         analysis_time = now_platform()
@@ -507,7 +667,6 @@ async def process_album(messages, context):
         )
 
         direction = parse_direction(result)
-
         keyboard = result_keyboard(prediction_id, direction)
 
         final_text = (
@@ -526,14 +685,13 @@ async def process_album(messages, context):
         logger.exception("Помилка аналізу пакета")
         await status.edit_text(
             "Не вдалося завершити аналіз.\n"
-            "Спробуй надіслати пакет ще раз."
+            "Перевір журнал Railway та спробуй ще раз."
         )
 
 
 async def flush_album(key, context):
     try:
         await asyncio.sleep(ALBUM_WAIT)
-
         album = ALBUMS.pop(key, None)
 
         if album:
@@ -542,3 +700,80 @@ async def flush_album(key, context):
     except asyncio.CancelledError:
         pass
 
+
+async def photo_handler(update, context):
+    message = update.effective_message
+
+    if not message:
+        return
+
+    if not (message.photo or message.document):
+        return
+
+    media_group_id = message.media_group_id
+
+    # Окреме зображення — окремий пакет.
+    if not media_group_id:
+        await process_album([message], context)
+        return
+
+    key = (
+        update.effective_chat.id,
+        media_group_id
+    )
+
+    album = ALBUMS.setdefault(
+        key,
+        {"messages": [], "task": None}
+    )
+
+    album["messages"].append(message)
+
+    old_task = album.get("task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    album["task"] = asyncio.create_task(
+        flush_album(key, context)
+    )
+
+
+# ---------- Запуск ----------
+
+def main():
+    init_db()
+
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+    application.add_handler(
+        CommandHandler("stats", stats_command)
+    )
+    application.add_handler(
+        CommandHandler("time", time_command)
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_result,
+            pattern=r"^result:"
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE,
+            photo_handler
+        )
+    )
+
+    logger.info("Nora запускається")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
