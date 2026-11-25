@@ -1,17 +1,16 @@
 
 import os
+import re
 import base64
 import logging
 import asyncio
-import re
 import sqlite3
 
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 from openai import OpenAI
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,14 +20,10 @@ from telegram.ext import (
     filters,
 )
 
-from matrix import (
-    full_matrix,
-    now_platform,
-    H4_ANCHOR_HOUR,
-)
 
-
-# ---------- Налаштування ----------
+# ============================================================
+# 1. НАЛАШТУВАННЯ
+# ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -40,8 +35,8 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 MAX_IMAGES = 5
-ALBUM_WAIT = 2.5
-MAX_OUTPUT_TOKENS = 950
+ALBUM_WAIT = 3.0
+MAX_OUTPUT_TOKENS = 1100
 DB_PATH = os.getenv("DB_PATH", "/data/nora.db")
 
 logging.basicConfig(
@@ -53,127 +48,345 @@ logger = logging.getLogger("Nora")
 ALBUMS = {}
 
 
-# ---------- Аналітична логіка Nora ----------
+# ============================================================
+# 2. МАТРИЦЯ ЧАСУ — ВБУДОВАНА В MAIN.PY
+# ============================================================
+
+TIMEFRAMES = [
+    ("M1", 1),
+    ("M2", 2),
+    ("M3", 3),
+    ("M5", 5),
+    ("M10", 10),
+    ("M15", 15),
+    ("M30", 30),
+    ("H1", 60),
+    ("H4", 240),
+]
+
+
+def parse_offset(value):
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", value or "")
+    return float(match.group()) if match else None
+
+
+try:
+    H4_ANCHOR_HOUR = int(
+        os.getenv("H4_ANCHOR_HOUR", "1")
+    ) % 24
+except ValueError:
+    H4_ANCHOR_HOUR = 1
+
+
+def now_platform():
+    utc_now = datetime.now(timezone.utc)
+
+    offset = parse_offset(
+        os.getenv("PLATFORM_UTC_OFFSET", "")
+    )
+
+    if offset is None:
+        kyiv_now = utc_now.astimezone(
+            ZoneInfo("Europe/Kyiv")
+        )
+        offset = (
+            kyiv_now.utcoffset().total_seconds() / 3600 + 1
+        )
+
+    return utc_now.astimezone(
+        timezone(timedelta(hours=offset))
+    )
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}г {minutes:02d}хв {seconds:02d}с"
+
+    return f"{minutes}хв {seconds:02d}с"
+
+
+def timeframe_shift(minutes):
+    if minutes == 240:
+        return H4_ANCHOR_HOUR * 60
+    return 0
+
+
+def timeframe_state(now, name, minutes):
+    now = now.replace(microsecond=0)
+
+    total_minutes = now.hour * 60 + now.minute
+    elapsed_minutes = (
+        total_minutes - timeframe_shift(minutes)
+    ) % minutes
+
+    elapsed = elapsed_minutes * 60 + now.second
+    remaining = minutes * 60 - elapsed
+
+    candle_open = now - timedelta(seconds=elapsed)
+    candle_close = candle_open + timedelta(minutes=minutes)
+
+    return {
+        "timeframe": name,
+        "minutes": minutes,
+        "opened_at": candle_open.strftime("%H:%M:%S"),
+        "closes_at": candle_close.strftime("%H:%M:%S"),
+        "elapsed_seconds": elapsed,
+        "remaining_seconds": remaining,
+        "progress_percent": round(
+            elapsed / (minutes * 60) * 100, 1
+        ),
+    }
+
+
+def minute_composition(now):
+    # Збережена початкова логіка декомпозиції хвилини.
+    parts = []
+
+    for name, minutes in TIMEFRAMES:
+        if name in ("M1", "H1", "H4"):
+            continue
+
+        q, r = divmod(now.minute, minutes)
+        parts.append(f"{name} {q}+{r}м")
+
+    return (
+        f"Склад хвилини :{now.minute:02d}: "
+        + ", ".join(parts)
+    )
+
+
+def matrix_snapshot(now=None):
+    now = now or now_platform()
+
+    lines = [
+        "МАТРИЦЯ ЧАСУ NORA",
+        f"ЧАС ПЛАТФОРМИ: {now:%Y-%m-%d %H:%M:%S}",
+        f"UTC ЗСУВ: {now.strftime('%z')}",
+        "",
+        "ПОТОЧНІ МІКРОВИМІРИ:",
+    ]
+
+    for name, minutes in TIMEFRAMES:
+        state = timeframe_state(now, name, minutes)
+
+        lines.append(
+            f"{name}: відкриття {state['opened_at']} | "
+            f"закриття {state['closes_at']} | "
+            f"минуло {format_duration(state['elapsed_seconds'])} | "
+            f"залишилось {format_duration(state['remaining_seconds'])} | "
+            f"заповнення {state['progress_percent']}%"
+        )
+
+    lines.extend([
+        "",
+        minute_composition(now),
+        "",
+        "Матриця показує часові координати, а не напрямок.",
+        f"H4 починається о {H4_ANCHOR_HOUR:02d}:00 "
+        "за часом платформи.",
+        "Фактичне вирівнювання H4 брокера потребує перевірки.",
+    ])
+
+    return "\n".join(lines)
+
+
+def upcoming_junctions(
+    now=None,
+    horizon_min=60,
+    min_timeframes=3,
+    limit=10
+):
+    now = now or now_platform()
+    base = now.replace(second=0, microsecond=0)
+
+    rows = []
+
+    for step in range(1, horizon_min + 1):
+        moment = base + timedelta(minutes=step)
+        total = moment.hour * 60 + moment.minute
+
+        closing = [
+            name
+            for name, minutes in TIMEFRAMES
+            if name != "M1"
+            and (
+                total - timeframe_shift(minutes)
+            ) % minutes == 0
+        ]
+
+        if len(closing) >= min_timeframes:
+            seconds_until = int(
+                (moment - now).total_seconds()
+            )
+
+            rows.append(
+                f"{moment:%H:%M} "
+                f"(через {format_duration(seconds_until)}): "
+                f"{', '.join(closing)}"
+            )
+
+        if len(rows) >= limit:
+            break
+
+    if not rows:
+        return (
+            f"У наступні {horizon_min} хв "
+            "не знайдено значних часових стиків."
+        )
+
+    return (
+        "МАЙБУТНІ ЧАСОВІ СТИКИ:\n"
+        + "\n".join(rows)
+        + "\nСтик — часова подія, не торговий сигнал."
+    )
+
+
+def full_matrix(now=None):
+    now = now or now_platform()
+
+    return (
+        matrix_snapshot(now)
+        + "\n\n"
+        + upcoming_junctions(now)
+    )
+
+
+# ============================================================
+# 3. ІНСТРУКЦІЯ АНАЛІЗУ NORA
+# ============================================================
 
 SYSTEM_PROMPT = f"""
 Ти Nora — аналітична помічниця користувача.
 Твоя основа — авторська система «Матриця часу».
 
-ГОЛОВНИЙ ПРИНЦИП:
+ГОЛОВНА ІДЕЯ:
+
 Різні таймфрейми — різні мікровиміри одного руху.
-Матриця часу об'єднує ці масштаби в одну часову структуру.
-Матриця — порожній календар. Вона сама не визначає напрямок.
-Скриншоти заповнюють календар цінами, рівнями, тілами,
-хвостами, швидкістю, ритмом і стадіями руху.
+Матриця часу об'єднує їх в одне ціле.
+Матриця — порожній календар, а не самостійний прогноз.
+
+Скриншоти заповнюють календар цінами, рівнями,
+розмірами свічок і хвостів, швидкістю, ритмом
+та стадіями руху.
 
 УСІ СКРИНШОТИ:
-- Аналізуй їх як одну структуру одного інструмента.
-- Це різні масштаби приблизно одного моменту, не послідовні кадри.
-- Не вважай порядок надсилання послідовністю руху.
-- Визначай таймфрейм тільки за видимими позначками.
-- Не вигадуй відсутні таймфрейми, ціни або рівні.
-- Якщо пари на скриншотах різні або це неможливо перевірити,
-  обирай WAIT.
+
+- Аналізуй як одну структуру одного інструмента.
+- Це різні масштаби приблизно одного моменту.
+- Не вважай порядок скриншотів послідовністю руху.
+- Визначай таймфрейм за видимою позначкою.
+- Не вигадуй відсутні таймфрейми.
+- Якщо валютні пари різні або це неможливо перевірити — WAIT.
 
 ПОСЛІДОВНІСТЬ АНАЛІЗУ:
 
-1. СПОЧАТКУ ВИЗНАЧ СТРУКТУРУ:
-- продовження руху;
+1. СТРУКТУРА РУХУ
+
+Визнач, що зараз відбувається:
+- продовження;
 - розворот;
 - корекція;
-- накопичення / стискання;
+- накопичення;
 - затор;
 - пружина;
 - шум;
 - змішана структура;
-- недостатньо даних.
+- невизначеність.
 
-Не називай пружиною будь-який довгий хвіст.
-Не називай розворотом будь-який відскок.
-Шукай підтвердження в декількох масштабах.
+Не називай будь-який хвіст пружиною.
+Не називай будь-який відскок розворотом.
 
-2. ПРОЧИТАЙ ВЗАЄМОДІЮ МІКРОВИМІРІВ:
-- де рух прискорюється або сповільнюється;
-- де свічки стискаються або розширюються;
-- як співвідносяться тіла та хвости;
-- чи є реакція на рівень;
-- чи підтримують нижчі масштаби старші;
-- чи суперечать масштаби один одному;
-- на якій стадії перебуває рух.
+2. МІКРОРУХИ
 
-Не вигадуй причину руху, якщо її не видно.
+Проаналізуй:
+- розмір тіл свічок;
+- довжину хвостів;
+- прискорення та уповільнення;
+- ритм руху;
+- стискання та розширення;
+- реакцію на рівні;
+- взаємодію молодших і старших масштабів.
 
-3. ВИЗНАЧ СЦЕНАРІЙ:
-Оціни, що ймовірніше:
-- продовження;
+Визнач, де рух починається, де розвивається,
+де втрачає швидкість і де може змінитися.
+
+3. СЦЕНАРІЙ
+
+Визнач найбільш обґрунтований сценарій:
+- продовження руху;
 - зміна напрямку;
-- відкат;
+- корекція;
 - боковий рух;
 - невизначеність.
 
-Відокремлюй те, що вже видно, від того, що лише очікується.
+Відокремлюй видимі факти від припущень.
 
-4. ПРОГНОЗ ПОШТОВХУ:
+4. ПОШТОВХ
+
 Визнач:
 - можливий напрямок;
-- що має статися перед поштовхом;
-- коли орієнтовно може з'явитися імпульс;
-- яка умова скасує сценарій.
+- що може запустити поштовх;
+- коли приблизно він може відбутися;
+- яка умова підтвердить сценарій;
+- що його скасує.
 
-Не вигадуй точну хвилину, якщо її неможливо обґрунтувати.
-Часовий стик матриці — лише часова подія.
-Він не означає автоматичного розвороту чи продовження.
+Часовий стик матриці сам по собі не є сигналом.
 
-5. ВХІД:
+5. ВХІД
+
 Обери тільки один варіант:
 - ЗАРАЗ;
-- ЧЕРЕЗ N ХВИЛИН;
-- ПІСЛЯ УМОВИ: конкретна видима умова;
+- ЧЕРЕЗ N ХВ;
+- ПІСЛЯ УМОВИ: конкретна умова;
 - НЕ ВХОДИТИ.
 
-Не пиши кілька альтернатив в одному полі.
 Не вигадуй точний час входу.
 
-6. ЕКСПІРАЦІЯ:
-Визнач окремо від напрямку та входу.
-Експірація — це тривалість після фактичного входу.
-Діапазон — від 1 до 60 хвилин.
+6. ЕКСПІРАЦІЯ
 
-НЕ використовуй формулу:
+Визнач окремо від напрямку та входу.
+
+Експірація — тривалість після фактичного входу.
+Допустимий діапазон: 1–60 хвилин.
+
+Не використовуй автоматично формулу:
 кількість свічок одного таймфрейму × його тривалість.
 
-НЕ прив'язуй експірацію автоматично до таймфрейму.
-НЕ використовуй постійні 3 або 15 хвилин.
-НЕ обирай експірацію лише через часовий стик.
+Не прив'язуй експірацію тільки до одного масштабу.
+Не використовуй постійні 3 або 15 хвилин.
+Не обирай експірацію лише через часовий стик.
 
 Оціни:
-- очікуваний шлях руху;
-- стадію формування імпульсу;
+- очікуваний розвиток руху;
+- стадію формування;
 - швидкість і ритм;
-- опірні та підтримувальні рівні на шляху;
-- взаємодію швидких і повільних масштабів;
-- скільки часу може знадобитися саме цьому сценарію;
-- чи не завершиться очікуваний рух раніше за експірацію.
+- відстань до рівнів;
+- взаємодію різних масштабів;
+- можливий час розвитку саме цього сценарію.
 
-Вибери одне обґрунтоване число від 1 до 60.
-Якщо неможливо обґрунтувати тривалість — WAIT.
-Не підганяй число під бажаний результат.
+Обери одне число від 1 до 60 хвилин.
+Обов'язково поясни, чому саме стільки часу.
+Якщо тривалість неможливо обґрунтувати — WAIT.
 
-7. ПЕРЕВІРКА:
-Якщо напрямок суперечливий, вхід не має підтвердження,
-скриншотів недостатньо або експірація не обґрунтована —
-обирай WAIT.
+7. КОНТРОЛЬ
 
-Не вигадуй відсоток точності.
+Якщо напрямок суперечливий,
+вхід не має підтвердження,
+скриншотів недостатньо
+або експірація не обґрунтована — WAIT.
+
+Не вигадуй відсотки точності.
 Не обіцяй прибуток.
-Не видавай припущення за факт.
 
-H4 у матриці починається о {H4_ANCHOR_HOUR:02d}:00
-за часом платформи. Реальне вирівнювання H4 у брокера
-може відрізнятися — враховуй це обмеження.
+H4 у часовій матриці прив'язана до
+{H4_ANCHOR_HOUR:02d}:00 за часом платформи.
+Фактичне вирівнювання H4 брокера може відрізнятися.
 
-ВІДПОВІДЬ КОРОТКА. Українською.
-Кожне поле з нового рядка. Без довгих вступів.
+ВІДПОВІДАЙ КОРОТКО, УКРАЇНСЬКОЮ.
 
 ФОРМАТ:
 
@@ -192,7 +405,9 @@ H4 у матриці починається о {H4_ANCHOR_HOUR:02d}:00
 """
 
 
-# ---------- База даних ----------
+# ============================================================
+# 4. БАЗА ДАНИХ
+# ============================================================
 
 def db_connect():
     db = sqlite3.connect(DB_PATH, timeout=20)
@@ -202,6 +417,7 @@ def db_connect():
 
 def init_db():
     folder = os.path.dirname(DB_PATH)
+
     if folder:
         os.makedirs(folder, exist_ok=True)
 
@@ -231,7 +447,6 @@ def init_db():
             )
         """)
 
-        # Безпечне доповнення вже наявної бази.
         existing = {
             row[1]
             for row in db.execute(
@@ -239,39 +454,44 @@ def init_db():
             ).fetchall()
         }
 
-        additions = {
-            "raw_text": "TEXT",
-            "platform_minute": "INTEGER",
-        }
-
-        for column, kind in additions.items():
+        for column, kind in (
+            ("raw_text", "TEXT"),
+            ("platform_minute", "INTEGER"),
+        ):
             if column not in existing:
                 db.execute(
-                    f"ALTER TABLE predictions ADD COLUMN {column} {kind}"
+                    f"ALTER TABLE predictions ADD COLUMN "
+                    f"{column} {kind}"
                 )
 
     logger.info("База Nora готова: %s", DB_PATH)
 
 
-# ---------- Розбір прогнозу ----------
-
-FIELD_PATTERN = (
-    r"^[\s>*_#\-•]*{field}[\s*_]*:[\s*_]*(.*)$"
-)
-
+# ============================================================
+# 5. РОЗБІР ВІДПОВІДІ
+# ============================================================
 
 def get_field(text, field):
+    pattern = (
+        r"^[\s>*_#\-•]*"
+        + re.escape(field)
+        + r"[\s*_]*:[\s*_]*(.*)$"
+    )
+
     match = re.search(
-        FIELD_PATTERN.format(field=re.escape(field)),
+        pattern,
         text,
         re.IGNORECASE | re.MULTILINE
     )
+
     return match.group(1).strip(" *_") if match else ""
 
 
 def parse_direction(text):
     value = get_field(text, "Напрямок").upper()
-    found = set(re.findall(r"\b(CALL|PUT|WAIT)\b", value))
+    found = set(
+        re.findall(r"\b(CALL|PUT|WAIT)\b", value)
+    )
 
     if len(found) == 1:
         return found.pop()
@@ -287,6 +507,7 @@ def parse_expiry(text):
         return None
 
     number = int(match.group(1))
+
     return number if 1 <= number <= 60 else None
 
 
@@ -294,23 +515,17 @@ def validate_analysis(result):
     direction = parse_direction(result)
     expiry = parse_expiry(result)
 
-    # Для CALL/PUT обов'язкова експірація 1–60 хв.
     if direction in ("CALL", "PUT") and expiry is None:
         direction = "WAIT"
 
     if direction == "WAIT":
         expiry = None
 
-    replacements = {
-        "Напрямок": (
-            f"Напрямок: {direction}"
-        ),
-        "Експірація": (
-            f"Експірація: {expiry} хв після входу"
-            if expiry
-            else "Експірація: не визначена"
-        ),
-    }
+    expiry_line = (
+        f"Експірація: {expiry} хв після входу"
+        if expiry is not None
+        else "Експірація: не визначена"
+    )
 
     lines = []
     found = set()
@@ -323,36 +538,49 @@ def validate_analysis(result):
         )
 
         if match:
-            key = match.group(1).capitalize()
+            key = match.group(1).lower()
             found.add(key)
-            lines.append(replacements[key])
+
+            if key == "напрямок":
+                lines.append(f"Напрямок: {direction}")
+            else:
+                lines.append(expiry_line)
         else:
             lines.append(line)
 
-    for key, value in replacements.items():
-        if key not in found:
-            lines.append(value)
+    if "напрямок" not in found:
+        lines.append(f"Напрямок: {direction}")
+
+    if "експірація" not in found:
+        lines.append(expiry_line)
 
     if direction == "WAIT":
-        entry_line = get_field("\n".join(lines), "Вхід")
-        if entry_line and entry_line.lower() not in (
-            "не входити", "wait", "не визначено"
-        ):
-            lines = [
-                "Вхід: не входити" if re.match(
-                    r"^\s*Вхід\s*:", line, re.IGNORECASE
-                ) else line
-                for line in lines
-            ]
+        replaced = False
+        new_lines = []
+
+        for line in lines:
+            if re.match(r"^\s*Вхід\s*:", line, re.IGNORECASE):
+                new_lines.append("Вхід: не входити")
+                replaced = True
+            else:
+                new_lines.append(line)
+
+        if not replaced:
+            new_lines.append("Вхід: не входити")
+
+        lines = new_lines
 
     return "\n".join(lines)
 
 
-# ---------- Аналіз зображень ----------
+# ============================================================
+# 6. АНАЛІЗ ЗОБРАЖЕНЬ
+# ============================================================
 
 def image_mime(image_bytes):
     if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
+
     return "image/jpeg"
 
 
@@ -360,29 +588,32 @@ def analyze_images(images, matrix_text):
     content = [{
         "type": "input_text",
         "text": (
-            "Проаналізуй цей пакет скриншотів за інструкцією Nora.\n"
-            "Це один інструмент і приблизно один момент часу.\n"
-            "Не сприймай скриншоти як послідовність кадрів.\n\n"
+            "Проаналізуй усі скриншоти як одну структуру "
+            "різних мікровимірів одного графіка.\n"
+            "Це приблизно один момент часу, не послідовність.\n\n"
             "ЧАСОВА МАТРИЦЯ:\n"
             + matrix_text
         )
     }]
 
     for index, image_bytes in enumerate(images, start=1):
-        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        encoded = base64.b64encode(
+            image_bytes
+        ).decode("utf-8")
 
         content.append({
             "type": "input_text",
             "text": (
-                f"Зображення {index}. "
-                "Визнач масштаб за видимою позначкою."
+                f"Скриншот {index}. "
+                "Визнач таймфрейм за видимою позначкою."
             )
         })
 
         content.append({
             "type": "input_image",
             "image_url": (
-                f"data:{image_mime(image_bytes)};base64,{encoded}"
+                f"data:{image_mime(image_bytes)};"
+                f"base64,{encoded}"
             ),
             "detail": "high"
         })
@@ -402,17 +633,18 @@ def analyze_images(images, matrix_text):
     if not raw.strip():
         raise RuntimeError("Модель повернула порожню відповідь")
 
-    validated = validate_analysis(raw)
-
     if getattr(response, "status", None) == "incomplete":
-        validated += (
-            "\n\nУВАГА: відповідь моделі була обірвана."
+        raise RuntimeError(
+            "Відповідь моделі обірвалася. "
+            "Прогноз не збережено."
         )
 
-    return validated, raw
+    return validate_analysis(raw), raw
 
 
-# ---------- Збереження прогнозу ----------
+# ============================================================
+# 7. ЗБЕРЕЖЕННЯ ПРОГНОЗУ
+# ============================================================
 
 def save_prediction(analysis, raw, images, platform_time):
     pair = get_field(analysis, "Пара")
@@ -423,10 +655,17 @@ def save_prediction(analysis, raw, images, platform_time):
     with db_connect() as db:
         cursor = db.execute("""
             INSERT INTO predictions (
-                created_at, platform_time, pair, direction,
-                entry, expiry_minutes, analysis,
-                screenshot_count, outcome,
-                raw_text, platform_minute
+                created_at,
+                platform_time,
+                pair,
+                direction,
+                entry,
+                expiry_minutes,
+                analysis,
+                screenshot_count,
+                outcome,
+                raw_text,
+                platform_minute
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         """, (
@@ -447,7 +686,8 @@ def save_prediction(analysis, raw, images, platform_time):
         for image_bytes in images:
             db.execute("""
                 INSERT INTO screenshots (
-                    prediction_id, image_data
+                    prediction_id,
+                    image_data
                 )
                 VALUES (?, ?)
             """, (
@@ -458,7 +698,9 @@ def save_prediction(analysis, raw, images, platform_time):
     return prediction_id
 
 
-# ---------- Кнопки результату ----------
+# ============================================================
+# 8. КНОПКИ РЕЗУЛЬТАТІВ
+# ============================================================
 
 def result_keyboard(prediction_id, direction):
     if direction == "WAIT":
@@ -513,7 +755,9 @@ async def handle_result(update, context):
         changed = cursor.rowcount
 
     if not changed:
-        await query.answer("Цей прогноз уже зафіксований.")
+        await query.answer(
+            "Цей прогноз уже зафіксований."
+        )
         return
 
     await query.answer("Результат збережено.")
@@ -521,17 +765,20 @@ async def handle_result(update, context):
     labels = {
         "win": "ПЛЮС",
         "loss": "МІНУС",
-        "skip": "ПРОПУЩЕНО",
+        "skip": "ПРОПУЩЕНО"
     }
 
     old_text = query.message.text or ""
+
     await query.edit_message_text(
         old_text + f"\n\nРезультат: {labels[outcome]}",
         reply_markup=None
     )
 
 
-# ---------- Статистика ----------
+# ============================================================
+# 9. СТАТИСТИКА
+# ============================================================
 
 async def stats_command(update, context):
     with db_connect() as db:
@@ -549,6 +796,7 @@ async def stats_command(update, context):
         """).fetchall()
 
     counts = dict(rows)
+
     wins = counts.get("win", 0)
     losses = counts.get("loss", 0)
     skipped = counts.get("skip", 0)
@@ -556,6 +804,7 @@ async def stats_command(update, context):
 
     total = sum(counts.values())
     completed = wins + losses
+
     accuracy = (
         wins / completed * 100
         if completed else 0
@@ -577,30 +826,40 @@ async def stats_command(update, context):
     ]
 
     for direction, outcome, count in directions:
-        lines.append(f"{direction} — {outcome}: {count}")
+        lines.append(
+            f"{direction} — {outcome}: {count}"
+        )
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
 
 
-# ---------- Часова матриця ----------
-
-async def time_command(update, context):
-    now = now_platform()
-    await update.message.reply_text(full_matrix(now))
-
+# ============================================================
+# 10. КОМАНДИ
+# ============================================================
 
 async def start_command(update, context):
     await update.message.reply_text(
-        "Я Nora — аналізую графік через Матрицю часу.\n\n"
+        "Я Nora — аналітична система Матриці часу.\n\n"
         "Надішли 3–5 скриншотів однієї валютної пари "
         "одним пакетом.\n\n"
-        "Команди:\n"
         "/time — часова матриця\n"
         "/stats — статистика прогнозів"
     )
 
 
-# ---------- Прийом скриншотів ----------
+async def time_command(update, context):
+    now = now_platform()
+
+    await update.message.reply_text(
+        full_matrix(now)
+    )
+
+
+# ============================================================
+# 11. ПРИЙМАННЯ СКРИНШОТІВ
+# ============================================================
 
 async def download_images(messages, context):
     images = []
@@ -610,6 +869,7 @@ async def download_images(messages, context):
 
         if message.photo:
             file_id = message.photo[-1].file_id
+
         elif (
             message.document
             and (message.document.mime_type or "").startswith("image/")
@@ -620,9 +880,11 @@ async def download_images(messages, context):
             continue
 
         telegram_file = await context.bot.get_file(file_id)
+
         image_bytes = bytes(
             await telegram_file.download_as_bytearray()
         )
+
         images.append(image_bytes)
 
     return images
@@ -632,16 +894,22 @@ async def process_album(messages, context):
     if not messages:
         return
 
-    messages.sort(key=lambda message: message.message_id)
+    messages.sort(
+        key=lambda message: message.message_id
+    )
+
     messages = messages[:MAX_IMAGES]
 
     status = await messages[0].reply_text(
-        f"Отримала пакет. Скриншотів: {len(messages)}.\n"
+        f"Отримала {len(messages)} скриншотів.\n"
         "Об'єдную мікровиміри та Матрицю часу..."
     )
 
     try:
-        images = await download_images(messages, context)
+        images = await download_images(
+            messages,
+            context
+        )
 
         if not images:
             await status.edit_text(
@@ -667,7 +935,11 @@ async def process_album(messages, context):
         )
 
         direction = parse_direction(result)
-        keyboard = result_keyboard(prediction_id, direction)
+
+        keyboard = result_keyboard(
+            prediction_id,
+            direction
+        )
 
         final_text = (
             f"{result}\n\n"
@@ -683,19 +955,24 @@ async def process_album(messages, context):
 
     except Exception:
         logger.exception("Помилка аналізу пакета")
+
         await status.edit_text(
             "Не вдалося завершити аналіз.\n"
-            "Перевір журнал Railway та спробуй ще раз."
+            "Спробуй надіслати пакет ще раз."
         )
 
 
 async def flush_album(key, context):
     try:
         await asyncio.sleep(ALBUM_WAIT)
+
         album = ALBUMS.pop(key, None)
 
         if album:
-            await process_album(album["messages"], context)
+            await process_album(
+                album["messages"],
+                context
+            )
 
     except asyncio.CancelledError:
         pass
@@ -712,7 +989,6 @@ async def photo_handler(update, context):
 
     media_group_id = message.media_group_id
 
-    # Окреме зображення — окремий пакет.
     if not media_group_id:
         await process_album([message], context)
         return
@@ -730,6 +1006,7 @@ async def photo_handler(update, context):
     album["messages"].append(message)
 
     old_task = album.get("task")
+
     if old_task and not old_task.done():
         old_task.cancel()
 
@@ -738,7 +1015,9 @@ async def photo_handler(update, context):
     )
 
 
-# ---------- Запуск ----------
+# ============================================================
+# 12. ЗАПУСК NORA
+# ============================================================
 
 def main():
     init_db()
@@ -752,18 +1031,22 @@ def main():
     application.add_handler(
         CommandHandler("start", start_command)
     )
+
     application.add_handler(
         CommandHandler("stats", stats_command)
     )
+
     application.add_handler(
         CommandHandler("time", time_command)
     )
+
     application.add_handler(
         CallbackQueryHandler(
             handle_result,
             pattern=r"^result:"
         )
     )
+
     application.add_handler(
         MessageHandler(
             filters.PHOTO | filters.Document.IMAGE,
@@ -772,6 +1055,7 @@ def main():
     )
 
     logger.info("Nora запускається")
+
     application.run_polling()
 
 
