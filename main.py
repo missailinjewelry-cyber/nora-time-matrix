@@ -223,4 +223,322 @@ def validate_analysis(result):
     direction = parse_direction(result)
     expiry = parse_expiry(result)
 
-    if direction in ("CALL", "
+    if direction in ("CALL", "PUT") and expiry is None:
+        direction = "WAIT"
+
+    if direction == "WAIT":
+        expiry = None
+
+    expiry_line = (
+        f"Експірація: {expiry} хв після входу"
+        if expiry else "Експірація: не визначена"
+    )
+
+    output = []
+    seen = set()
+
+    for line in result.strip().splitlines():
+        match = LINE_PATTERN.match(line)
+
+        if not match:
+            output.append(line)
+            continue
+
+        key = match.group(1).lower()
+        seen.add(key)
+
+        if key == "напрямок":
+            output.append(f"Напрямок: {direction}")
+        elif key == "експірація":
+            output.append(expiry_line)
+        elif direction == "WAIT":
+            output.append("Вхід: не входити")
+        else:
+            output.append(line.strip())
+
+    if "напрямок" not in seen:
+        output.append(f"Напрямок: {direction}")
+
+    if "експірація" not in seen:
+        output.append(expiry_line)
+
+    if direction == "WAIT" and "вхід" not in seen:
+        output.append("Вхід: не входити")
+
+    return "\n".join(output)
+
+
+# ---------- Аналіз ----------
+
+def image_mime(image_bytes):
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return "image/jpeg"
+
+
+def analyze_images(images, matrix_text):
+    content = [{
+        "type": "input_text",
+        "text": (
+            "Проаналізуй усі скриншоти як одну структуру "
+            "різних мікровимірів одного графіка.\n\n"
+            "ЧАСОВА МАТРИЦЯ:\n"
+            + matrix_text
+        )
+    }]
+
+    for index, image_bytes in enumerate(images, start=1):
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+
+        content.append({
+            "type": "input_text",
+            "text": f"Скриншот {index}: окремий часовий масштаб."
+        })
+
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:{image_mime(image_bytes)};base64,{encoded}",
+            "detail": "high"
+        })
+
+    response = client.responses.create(
+        model=MODEL,
+        instructions=SYSTEM_PROMPT,
+        input=[{"role": "user", "content": content}],
+        max_output_tokens=MAX_OUTPUT_TOKENS
+    )
+
+    raw = response.output_text or ""
+    validated = validate_analysis(raw)
+
+    if getattr(response, "status", None) == "incomplete":
+        validated += (
+            "\n\nВідповідь обірвалась, висновок міг бути неповним."
+        )
+
+    return validated, raw
+
+
+def save_prediction(analysis, raw, images, platform_time):
+    pair = get_field(analysis, "Пара")
+    direction = parse_direction(analysis)
+    entry = get_field(analysis, "Вхід")
+    expiry = parse_expiry(analysis)
+
+    with db_connect() as db:
+        cursor = db.execute("""
+            INSERT INTO predictions (
+                created_at, platform_time, pair, direction,
+                entry, expiry_minutes, analysis,
+                screenshot_count, outcome,
+                raw_text, platform_minute
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        """, (
+            platform_time.isoformat(),
+            platform_time.strftime("%Y-%m-%d %H:%M:%S"),
+            pair,
+            direction,
+            entry,
+            expiry,
+            analysis,
+            len(images),
+            raw,
+            platform_time.minute
+        ))
+
+        prediction_id = cursor.lastrowid
+
+        for image_bytes in images:
+            db.execute("""
+                INSERT INTO screenshots (
+                    prediction_id, image_data
+                )
+                VALUES (?, ?)
+            """, (prediction_id, sqlite3.Binary(image_bytes)))
+
+    return prediction_id
+
+
+# ---------- Кнопки результату ----------
+
+def result_keyboard(prediction_id, direction):
+    if direction == "WAIT":
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "WAIT — пропуск",
+                callback_data=f"result:{prediction_id}:skip"
+            )
+        ]])
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "Зайшла (+)",
+                callback_data=f"result:{prediction_id}:win"
+            ),
+            InlineKeyboardButton(
+                "Не зайшла (−)",
+                callback_data=f"result:{prediction_id}:loss"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Пропустила",
+                callback_data=f"result:{prediction_id}:skip"
+            )
+        ]
+    ])
+
+
+async def handle_result(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+
+    # На callback можна відповісти лише один раз, тому відповідаємо
+    # в кінці кожної гілки.
+    try:
+        _, prediction_id, outcome = query.data.split(":")
+        prediction_id = int(prediction_id)
+    except (ValueError, AttributeError):
+        await query.answer("Не вдалося прочитати результат.")
+        return
+
+    if outcome not in ("win", "loss", "skip"):
+        await query.answer()
+        return
+
+    with db_connect() as db:
+        cursor = db.execute("""
+            UPDATE predictions
+            SET outcome = ?
+            WHERE id = ? AND outcome = 'pending'
+        """, (outcome, prediction_id))
+
+        changed = cursor.rowcount
+
+    if not changed:
+        await query.answer("Цей прогноз уже зафіксований.")
+        return
+
+    await query.answer()
+
+    labels = {
+        "win": "ПЛЮС",
+        "loss": "МІНУС",
+        "skip": "ПРОПУЩЕНО"
+    }
+
+    old_text = query.message.text or ""
+    new_text = old_text + f"\n\nРезультат: {labels[outcome]}"
+
+    await query.edit_message_text(
+        new_text,
+        reply_markup=None
+    )
+
+
+# ---------- Прийом скрінів ----------
+
+async def download_images(messages, context):
+    images = []
+
+    for message in messages:
+        file_id = None
+
+        if message.photo:
+            file_id = message.photo[-1].file_id
+        elif (
+            message.document
+            and (message.document.mime_type or "").startswith("image/")
+        ):
+            file_id = message.document.file_id
+
+        if not file_id:
+            continue
+
+        telegram_file = await context.bot.get_file(file_id)
+
+        image_bytes = bytes(
+            await telegram_file.download_as_bytearray()
+        )
+
+        images.append(image_bytes)
+
+    return images
+
+
+async def process_album(messages, context):
+    if not messages:
+        return
+
+    messages.sort(key=lambda message: message.message_id)
+    messages = messages[:MAX_IMAGES]
+
+    status = await messages[0].reply_text(
+        f"Отримала {len(messages)} скриншотів.\n"
+        "Об'єдную мікровиміри та матрицю часу..."
+    )
+
+    try:
+        images = await download_images(messages, context)
+
+        if not images:
+            await status.edit_text("Не вдалося отримати зображення.")
+            return
+
+        analysis_time = now_platform()
+        matrix_text = full_matrix(analysis_time)
+
+        result, raw = await asyncio.to_thread(
+            analyze_images,
+            images,
+            matrix_text
+        )
+
+        prediction_id = await asyncio.to_thread(
+            save_prediction,
+            result,
+            raw,
+            images,
+            analysis_time
+        )
+
+        direction = parse_direction(result)
+
+        keyboard = result_keyboard(prediction_id, direction)
+
+        final_text = (
+            f"{result}\n\n"
+            f"Час платформи: {analysis_time:%H:%M:%S}\n"
+            f"Номер прогнозу: #{prediction_id}\n\n"
+            "Зафіксуй результат кнопкою нижче:"
+        )
+
+        await status.edit_text(
+            final_text,
+            reply_markup=keyboard
+        )
+
+    except Exception:
+        logger.exception("Помилка аналізу пакета")
+        await status.edit_text(
+            "Не вдалося завершити аналіз.\n"
+            "Спробуй надіслати пакет ще раз."
+        )
+
+
+async def flush_album(key, context):
+    try:
+        await asyncio.sleep(ALBUM_WAIT)
+
+        album = ALBUMS.pop(key, None)
+
+        if album:
+            await process_album(album["messages"], context)
+
+    except asyncio.CancelledError:
+        pass
+
