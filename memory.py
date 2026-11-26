@@ -12,6 +12,11 @@ import matrix
 
 DB_PATH = os.getenv("DB_PATH", "/data/nora.db")
 VERSION = "hybrid-1"  # мітка версії логіки, щоб рахувати статистику окремо від старих прогнозів
+
+
+def version_label():
+    """У режимі light мітка інша, тому статистика двох режимів рахується окремо."""
+    return VERSION + ("-light" if matrix.MATRIX_MODE == "light" else "")
 STORE_SCREENSHOTS = os.getenv("STORE_SCREENSHOTS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 try:
@@ -24,6 +29,7 @@ if not 0.3 <= PAYOUT <= 1.5:
 DIARY_HOURS = 3
 DIARY_LIMIT = 12
 TIMEFRAMES = ["M1", "M2", "M3", "M5", "M10", "M15", "M30", "H1", "H4"]
+MAX_NOW_TFS = 3  # скільки таймфреймів Nora може попросити одним запитом СКРІН_ЗАРАЗ
 
 
 # ============================================================
@@ -376,10 +382,18 @@ def parse_action(text):
     for token in re.findall(r"\b(M1|M2|M3|M5|M10|M15|M30|H1|H4)\b", upper):
         if token not in tfs:
             tfs.append(token)
-    tf = tfs[0] if len(tfs) == 1 else None
-    if len(tfs) > 1:
-        # кілька таймфреймів у запиті: це не одне конкретне питання
-        return {"kind": "conflict", "tf": None, "delay_min": None, "clock": None}
+    # СКРІН_ЗАРАЗ може просити до трьох таймфреймів одразу («H1, M1»), СКРІН_ПІЗНІШЕ рівно один.
+    # Більше це схоже на шаблон, а не на конкретне питання.
+    if kinds[0] == "now":
+        if len(tfs) > MAX_NOW_TFS:
+            return {"kind": "conflict", "tf": None, "delay_min": None, "clock": None}
+        tf = ", ".join(tfs) if tfs else None
+    elif kinds[0] == "later":
+        if len(tfs) > 1:
+            return {"kind": "conflict", "tf": None, "delay_min": None, "clock": None}
+        tf = tfs[0] if tfs else None
+    else:
+        tf = None
 
     delay = None
     clock = None
@@ -419,7 +433,7 @@ def interpret_reply(raw, now_left, later_left):
     kind = act["kind"]
     if kind in ("now", "later"):
         if act["tf"] is None:
-            return {"type": "invalid", "why": "у рядку ДІЯ має бути рівно один таймфрейм (M1, M2, M3, M5, M10, M15, M30, H1 або H4)"}
+            return {"type": "invalid", "why": "у рядку ДІЯ має бути таймфрейм (M1, M2, M3, M5, M10, M15, M30, H1 або H4): для СКРІН_ЗАРАЗ до трьох через кому, для СКРІН_ПІЗНІШЕ один"}
         left = now_left if kind == "now" else later_left
         if left <= 0:
             name = "СКРІН_ЗАРАЗ" if kind == "now" else "СКРІН_ПІЗНІШЕ"
@@ -480,6 +494,39 @@ def parse_expiry(text):
     return number if 1 <= number <= 60 else None
 
 
+_CLOCK = r"([01]?\d|2[0-3])[:.]([0-5]\d)(?:[:.]([0-5]\d))?"
+
+
+def parse_expiry_clock(text, now):
+    """Режим light: модель називає ЧАС КІНЦЯ («до 20:30:00»), хвилини рахує код від входу.
+
+    Повертає хвилини (1-60) або None. Рядок, що починається з «до HH:MM», вважаємо часом кінця;
+    якщо в рядку є «N хв», беремо хвилини; інакше шукаємо час кінця після слів «о», «до», «кінець».
+    """
+    value = get_field(text, "ЕКСПІРАЦІЯ").upper()
+    if not value:
+        return None
+    start = matrix.entry_time(now)
+
+    def minutes_to(h, mnt, sec):
+        end = start.replace(hour=int(h), minute=int(mnt), second=int(sec or 0), microsecond=0)
+        if end <= start:
+            end += timedelta(days=1)
+        minutes = round((end - start).total_seconds() / 60)
+        return minutes if 1 <= minutes <= 60 else None
+
+    lead = re.match(r"\s*(?:ДО|О|ОБ)\s*" + _CLOCK, value)
+    if lead:
+        return minutes_to(*lead.groups())
+    plain = parse_expiry(text)
+    if plain is not None:
+        return plain
+    anywhere = re.search(r"(?:ДО|ОБ|\bО|ЗАКІНЧУЄТЬСЯ|КІНЕЦЬ|ЗАКРИТТЯ)\s*" + _CLOCK, value)
+    if anywhere:
+        return minutes_to(*anywhere.groups())
+    return None
+
+
 def parse_summary(text):
     return get_field(text, "ПІДСУМОК")[:220]
 
@@ -507,11 +554,11 @@ def finalize_text(text, now):
     """
     text = (text or "").strip()
     direction = parse_verdict(text)
-    expiry = parse_expiry(text)
+    expiry = parse_expiry_clock(text, now) if matrix.MATRIX_MODE == "light" else parse_expiry(text)
     notes = []
 
     if direction in ("CALL", "PUT") and expiry is None:
-        notes.append("⚠️ Вхід скасовано кодом: у відповіді немає зрозумілої експірації (1-60 хв).")
+        notes.append("⚠️ Вхід скасовано кодом: у відповіді немає зрозумілої експірації (1-60 хв від входу).")
         direction = "WAIT"
     if not get_field(text, "ВЕРДИКТ"):
         notes.append("⚠️ У відповіді немає рядка ВЕРДИКТ, тому рахую як «не вхід».")
@@ -624,7 +671,7 @@ def save_prediction(analysis, raw, images, platform_time, direction, expiry, rou
         """, (
             platform_time.isoformat(), platform_time.strftime("%Y-%m-%d %H:%M:%S"),
             pair, direction, entry, expiry, analysis, len(images), outcome,
-            raw, platform_time.minute, summary, character, VERSION, rounds_used,
+            raw, platform_time.minute, summary, character, version_label(), rounds_used,
         ))
         prediction_id = cursor.lastrowid
         if STORE_SCREENSHOTS:
