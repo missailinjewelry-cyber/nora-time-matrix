@@ -220,6 +220,8 @@ def compute_due(request, now):
     Повертає (момент, пояснення).
     """
     tf = request["tf"]
+    if request.get("due") is not None:  # час уже порахував код (фінал «чекаємо N хв»)
+        return request["due"], None
     if request["delay_min"] is not None and 1 <= request["delay_min"] <= MAX_LATER_MINUTES:
         return snap_to_close(tf, now + timedelta(minutes=request["delay_min"]), now), None
     if request["clock"] is not None:
@@ -244,6 +246,9 @@ async def apply_request(session, request, raw, round_no, bot):
         due, note = compute_due(request, now)
 
     reading = memory.get_block(raw, "ЧИТАННЯ")
+    if not reading:  # запит, утворений із фіналу, не має рядка ЧИТАННЯ
+        reading = " ".join(x for x in (memory.get_field(raw, "АКТИВНИЙ ТАЙМФРЕЙМ"),
+                                       memory.get_field(raw, "МАТРИЦЯ")) if x)
     character = memory.parse_character(raw)
     pair = memory.parse_pair(raw)
     summary = (
@@ -277,11 +282,17 @@ async def apply_request(session, request, raw, round_no, bot):
             f"(через {human_left((due - now).total_seconds())}).\n"
             f"Навіщо: {request['reason']}\n"
             + (f"\n{seen_text}\n" if seen_text else "")
+            + ("\nЦе ще не фінал: я продовжу цей самий аналіз, коли надішлеш скрін. "
+               "Можеш додати й інші таймфрейми, якщо вважаєш потрібним.\n" if request.get("converted") else "")
             + "\nРаніше не надсилай: потрібна вже сформована свічка. Я нагадаю, коли час настане."
         )
         if note:
             text += f"\n({note})"
-    await send_long(bot, session["chat_id"], text)
+    await send_long(bot, session["chat_id"], text, reply_markup=stop_keyboard("⏹ Скасувати цей аналіз"))
+
+
+def stop_keyboard(label="⏹ Не стежити"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="stop:chat")]])
 
 
 def result_keyboard(prediction_id):
@@ -327,7 +338,12 @@ async def send_final(session, raw, matrix_time, rounds_used, image_rows, bot):
         f"🕒 Час платформи: {platform_time:%H:%M:%S}\n"
         f"🔢 Прогноз №{prediction_id}"
     )
-    keyboard = result_keyboard(prediction_id) if direction in ("CALL", "PUT") else None
+    if direction in ("CALL", "PUT"):
+        keyboard = result_keyboard(prediction_id)
+    elif reminder_line:
+        keyboard = stop_keyboard("⏹ Не нагадувати")
+    else:
+        keyboard = None
     await send_long(bot, session["chat_id"], text, reply_markup=keyboard)
 
 
@@ -382,6 +398,11 @@ async def evaluate_session(session_id, bot):
                 return
 
             if verdict["type"] == "final":
+                converted = memory.wait_as_request(raw, T0, later_left)
+                if converted is not None:
+                    logger.info("Фінал «чекаємо» перетворено на запит скріна пізніше (сесія %s)", session_id)
+                    await apply_request(session, converted, raw, round_no, bot)
+                    return
                 await send_final(session, raw, T0, round_no, image_rows, bot)
                 return
 
@@ -454,7 +475,9 @@ async def process_batch(messages, context):
                     await first.reply_text(
                         f"Ще рано. Скрін {active['request_timeframe']} потрібен о {due:%H:%M:%S} "
                         f"(через {human_left(wait)}), коли свічка вже сформується. "
-                        "Надішли його тоді."
+                        "Надішли його тоді.\n\nЯкщо це інша пара чи новий графік, скасуй попереднє "
+                        "стеження кнопкою нижче й надішли скріни ще раз.",
+                        reply_markup=stop_keyboard("⏹ Скасувати стеження"),
                     )
                     return
 
@@ -474,9 +497,12 @@ async def process_batch(messages, context):
                 )
                 text = f"✅ Додала {len(images)} скрін(ів) до поточної сесії. Порівнюю з попередніми..."
             else:
+                dropped = memory.cancel_reminders(chat_id)
                 session_id = memory.create_session(chat_id, user_id, captured_at)
                 memory.add_session_images(session_id, 0, images, matrix_text, captured_at)
                 text = f"📷 Отримала скрінів: {len(images)}. Аналізую..."
+                if dropped:
+                    text += "\n(Нагадування про попередній графік скасовано.)"
             if extra_count:
                 text += f"\n(Взяла перші {MAX_IMAGES}, ще {extra_count} пропущено.)"
             await status_message.edit_text(text)
@@ -531,7 +557,7 @@ async def photo_handler(update, context):
 
 def main_keyboard():
     return ReplyKeyboardMarkup(
-        [["▶️ Почати роботу"], ["🌙 Завершити роботу"]],
+        [["▶️ Почати роботу"], ["⏹ Скасувати стеження"], ["🌙 Завершити роботу"]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -564,10 +590,11 @@ async def start_command(update, context):
         "Я Nora, аналітична система Матриці часу.\n"
         f"Поточний режим: {status}.\n\n"
         "▶️ Почати роботу: активувати аналіз.\n"
+        "⏹ Скасувати стеження: Nora більше не нагадує про цей графік, можна починати новий.\n"
         "🌙 Завершити роботу: скасувати незавершені сесії.\n\n"
         "/time: матриця часу зараз\n"
         "/stats: статистика\n"
-        "/cancel: скасувати поточний аналіз\n"
+        "/cancel: те саме, що ⏹ Скасувати стеження\n"
         "/last: сира відповідь ШІ останнього прогнозу\n"
         "/id: твій Telegram id",
         reply_markup=main_keyboard(),
@@ -600,11 +627,36 @@ async def last_command(update, context):
     await send_long(context.bot, update.effective_chat.id, text)
 
 
+def cancel_report(chat_id):
+    sessions, reminders = memory.cancel_tracking(chat_id)
+    if not sessions and not reminders:
+        return "Зараз немає чого скасовувати. Можеш надсилати скріни."
+    parts = []
+    if sessions:
+        parts.append("поточний аналіз")
+    if reminders:
+        parts.append("нагадування")
+    return f"⏹ Стеження скасовано ({' і '.join(parts)}). Надсилай скріни нового графіка."
+
+
 async def cancel_command(update, context):
     if not allowed(update):
         return
-    memory.cancel_all_sessions(update.effective_chat.id)
-    await update.message.reply_text("Поточний аналіз скасовано. Можеш надсилати новий пакет скрінів.")
+    await update.effective_message.reply_text(cancel_report(update.effective_chat.id))
+
+
+async def handle_stop(update, context):
+    query = update.callback_query
+    if not allowed(update):
+        await query.answer("Немає доступу.")
+        return
+    report = cancel_report(query.message.chat_id)
+    await query.answer("Скасовано.")
+    base = (query.message.text or "").split("\n\n⏹")[0]
+    try:
+        await query.edit_message_text(base + "\n\n" + report.replace("\n", " "), reply_markup=None)
+    except Exception:
+        logger.exception("Не вдалося оновити повідомлення після скасування")
 
 
 async def id_command(update, context):
@@ -617,6 +669,8 @@ async def text_button_handler(update, context):
     text = (update.effective_message.text or "").strip()
     if text == "▶️ Почати роботу":
         await start_work(update, context)
+    elif text == "⏹ Скасувати стеження":
+        await update.effective_message.reply_text(cancel_report(update.effective_chat.id))
     elif text == "🌙 Завершити роботу":
         await stop_work(update, context)
 
@@ -745,8 +799,9 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CallbackQueryHandler(handle_result, pattern=r"^result:"))
+    application.add_handler(CallbackQueryHandler(handle_stop, pattern=r"^stop:"))
     application.add_handler(
-        MessageHandler(filters.Regex(r"^(▶️ Почати роботу|🌙 Завершити роботу)$"), text_button_handler)
+        MessageHandler(filters.Regex(r"^(▶️ Почати роботу|⏹ Скасувати стеження|🌙 Завершити роботу)$"), text_button_handler)
     )
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_handler))
     application.add_error_handler(on_error)
