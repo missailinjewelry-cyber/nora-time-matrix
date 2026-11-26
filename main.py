@@ -64,6 +64,7 @@ CANCEL_AFTER_REMINDER_SECONDS = _int_env("CANCEL_AFTER_REMINDER_SECONDS", 120)
 EARLY_TOLERANCE_SECONDS = _int_env("EARLY_TOLERANCE_SECONDS", 20)
 SCHEDULER_INTERVAL_SECONDS = _int_env("SCHEDULER_INTERVAL_SECONDS", 10)
 CLOSE_PADDING_SECONDS = 3  # скрін просимо за кілька секунд після закриття свічки
+REMINDER_MAX_LATE_SECONDS = 600  # нагадування, що запізнилось більш ніж на 10 хв, не надсилаємо
 SNAP_SECONDS = 60  # якщо запитаний час ближче за стільки до закриття свічки, зсуваємо на закриття
 
 
@@ -308,11 +309,19 @@ async def send_final(session, raw, matrix_time, rounds_used, image_rows, bot):
     memory.finish_session(session["id"], "completed", platform_time)
 
     pair = memory.parse_pair(body) or "пара не визначена"
+    reminder_line = ""
+    if direction == "WAIT":
+        due = memory.wait_due(raw, matrix_time)
+        if due is not None:
+            note = memory.get_field(body, "ТОЧКА ВХОДУ")[:250]
+            memory.add_reminder(session["chat_id"], pair, note, due, platform_time)
+            reminder_line = f"🔔 Нагадаю о {due:%H:%M:%S}, щоб глянути знову.\n\n"
     text = (
         f"📊 {pair}\n"
         "━━━━━━━━━━━━━━\n"
         f"🧭 {memory.direction_label(direction)}\n\n"
         f"{body}\n\n"
+        f"{reminder_line}"
         f"🕒 Час платформи: {platform_time:%H:%M:%S}\n"
         f"🔢 Прогноз №{prediction_id}"
     )
@@ -686,6 +695,15 @@ async def scheduler_loop(application):
                             chat_id,
                             "⌛ Скрін не надійшов. Аналіз скасовано, прогноз не створено, статистику не змінено.",
                         )
+                for r in memory.due_reminders(now):
+                    memory.mark_reminder_done(r["id"])
+                    if (now - r["due_at"]).total_seconds() > REMINDER_MAX_LATE_SECONDS:
+                        continue  # бот довго не працював, нагадування застаріло
+                    text = f"⏰ Час глянути знову: {r['pair'] or 'графік'}.\nМинуле рішення: не вхід."
+                    if r["note"]:
+                        text += f"\nЩо мало з'явитися: {r['note']}"
+                    text += "\n\nНадішли свіжий пакет скрінів (H1, M15, M3), Nora подивиться ще раз."
+                    await application.bot.send_message(r["chat_id"], text)
             await asyncio.sleep(SCHEDULER_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
