@@ -319,6 +319,24 @@ def cancel_all_sessions(chat_id=None):
             db.execute("UPDATE reminders SET done=1 WHERE chat_id=? AND done=0", (chat_id,))
 
 
+def cancel_reminders(chat_id):
+    """Закриває нагадування чату. Повертає, скільки їх було."""
+    with db_connect() as db:
+        return db.execute("UPDATE reminders SET done=1 WHERE chat_id=? AND done=0", (chat_id,)).rowcount
+
+
+def cancel_tracking(chat_id):
+    """Припиняє стеження в чаті: активні сесії й нагадування. Повертає (сесій, нагадувань)."""
+    with db_connect() as db:
+        sessions = db.execute(
+            "SELECT COUNT(*) FROM analysis_sessions WHERE chat_id=? AND status IN ('processing', 'waiting')",
+            (chat_id,)).fetchone()[0]
+        reminders = db.execute(
+            "SELECT COUNT(*) FROM reminders WHERE chat_id=? AND done=0", (chat_id,)).fetchone()[0]
+    cancel_all_sessions(chat_id)
+    return sessions, reminders
+
+
 def waiting_sessions():
     with db_connect() as db:
         rows = db.execute(f"""
@@ -618,6 +636,29 @@ def wait_due(text, now):
         return None
     rounded = (target + timedelta(seconds=30)).replace(second=0, microsecond=0)
     return rounded + timedelta(seconds=3)
+
+
+def wait_as_request(raw, now, later_left):
+    """Фінал «НЕ ВХІД, ЧЕКАЄМО N хв» при вільному ліміті «пізніше» стає запитом скріна.
+
+    Так аналіз триває в тій самій сесії (Nora побачить старі й нові скріни разом),
+    а не закінчується й починається з нуля. Без числа хвилин або без ліміту повертає None.
+    """
+    if later_left <= 0 or parse_verdict(raw) != "WAIT":
+        return None
+    due = wait_due(raw, now)
+    if due is None:
+        return None
+    tfs = []
+    for source in (get_field(raw, "ТОЧКА ВХОДУ"), get_field(raw, "АКТИВНИЙ ТАЙМФРЕЙМ")):
+        for token in re.findall(r"\b(M1|M2|M3|M5|M10|M15|M30|H1|H4)\b", _norm_tf_text(source).upper()):
+            if token not in tfs:
+                tfs.append(token)
+        if tfs:
+            break
+    reason = get_field(raw, "ТОЧКА ВХОДУ") or get_field(raw, "ВЕРДИКТ") or "перевірити, що змінилось"
+    return {"type": "request", "kind": "later", "tf": ", ".join(tfs[:2]) or "M1",
+            "delay_min": None, "clock": None, "due": due, "reason": reason[:300], "converted": True}
 
 
 def add_reminder(chat_id, pair, note, due_at, now):
