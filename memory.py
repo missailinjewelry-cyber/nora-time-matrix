@@ -113,6 +113,19 @@ def init_db():
             ("notes", "TEXT"),
         ])
 
+        # Нагадування «глянь знову» після фіналу «не вхід, чекаємо N хв»: без сесії й без ШІ.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                pair TEXT,
+                note TEXT,
+                due_at TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS session_images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,6 +210,7 @@ def get_session(session_id):
 def create_session(chat_id, user_id, now):
     stamp = now.isoformat()
     with db_connect() as db:
+        db.execute("UPDATE reminders SET done=1 WHERE chat_id=? AND done=0", (chat_id,))
         cursor = db.execute("""
             INSERT INTO analysis_sessions (
                 chat_id, user_id, status, request_round, created_at, updated_at
@@ -293,6 +307,10 @@ def cancel_all_sessions(chat_id=None):
         """, args)
         for sid in ids:
             db.execute("DELETE FROM session_images WHERE session_id=?", (sid,))
+        if chat_id is None:
+            db.execute("UPDATE reminders SET done=1 WHERE done=0")
+        else:
+            db.execute("UPDATE reminders SET done=1 WHERE chat_id=? AND done=0", (chat_id,))
 
 
 def waiting_sessions():
@@ -525,6 +543,64 @@ def finalize_text(text, now):
     if notes:
         body += "\n\n" + "\n".join(notes)
     return body, direction, expiry
+
+
+def wait_due(text, now):
+    """З вердикту «НЕ ВХІД, ЧЕКАЄМО N хв» (або «чекаємо до HH:MM») дістає, коли нагадати.
+
+    Повертає момент або None. Час округлюється до хвилини (стики на :00) і +3 с,
+    щоб скрін зробили вже після закриття свічки.
+    """
+    value = get_field(text, "ВЕРДИКТ").upper()
+    if not value:
+        return None
+    target = None
+    match = re.search(r"ЧЕКАЄМО\s*(?:ЩЕ\s*)?(?:ПРИБЛИЗНО\s*|~\s*)?(\d{1,2})\s*ХВ", value)
+    if match:
+        minutes = int(match.group(1))
+        if 1 <= minutes <= 60:
+            target = now + timedelta(minutes=minutes)
+    else:
+        match = re.search(r"ЧЕКАЄМО\s*ДО\s*([01]?\d|2[0-3])[:.]([0-5]\d)", value)
+        if match:
+            cand = now.replace(hour=int(match.group(1)), minute=int(match.group(2)),
+                               second=0, microsecond=0)
+            if now < cand <= now + timedelta(minutes=60):
+                target = cand
+    if target is None:
+        return None
+    rounded = (target + timedelta(seconds=30)).replace(second=0, microsecond=0)
+    return rounded + timedelta(seconds=3)
+
+
+def add_reminder(chat_id, pair, note, due_at, now):
+    with db_connect() as db:
+        db.execute("UPDATE reminders SET done=1 WHERE chat_id=? AND done=0", (chat_id,))
+        db.execute("""
+            INSERT INTO reminders(chat_id, pair, note, due_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (chat_id, pair, note, due_at.isoformat(), now.isoformat()))
+
+
+def due_reminders(now):
+    with db_connect() as db:
+        rows = db.execute(
+            "SELECT id, chat_id, pair, note, due_at FROM reminders WHERE done=0"
+        ).fetchall()
+    result = []
+    for rid, chat_id, pair, note, due in rows:
+        try:
+            moment = datetime.fromisoformat(due)
+        except ValueError:
+            continue
+        if moment <= now:
+            result.append({"id": rid, "chat_id": chat_id, "pair": pair, "note": note, "due_at": moment})
+    return result
+
+
+def mark_reminder_done(reminder_id):
+    with db_connect() as db:
+        db.execute("UPDATE reminders SET done=1 WHERE id=?", (reminder_id,))
 
 
 # ============================================================
