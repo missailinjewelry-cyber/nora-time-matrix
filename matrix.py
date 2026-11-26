@@ -20,6 +20,11 @@ H4_STARTS = ", ".join(
     f"{h:02d}" for h in sorted((H4_ANCHOR_HOUR + 4 * k) % 24 for k in range(6))
 )
 
+# Режим подачі матриці моделі:
+#   full  : зріз + стики + таблиця «КАНДИДАТИ ЕКСПІРАЦІЇ»; N обирає модель із таблиці;
+#   light : як у Mia, зріз + стики; модель називає час кінця угоди, а хвилини рахує код.
+MATRIX_MODE = "light" if os.getenv("MATRIX_MODE", "").strip().lower() == "light" else "full"
+
 # Скільки секунд минає від скріна до ручного входу (аналіз 10-40 с).
 ENTRY_DELAY_SEC = int(_number(os.getenv("ENTRY_DELAY_SEC", ""), 40))
 
@@ -173,3 +178,21 @@ def full_matrix(now=None):
         + "\n\n"
         + expiry_grid(now)
     )
+
+
+def light_matrix(now=None):
+    """Матриця для режиму light: те саме, що бачить Mia, без таблиці експірацій."""
+    now = now or now_platform()
+    return (
+        matrix_snapshot(now)
+        + "\n\n"
+        + upcoming_junctions(now)
+        + "\n\n"
+        + f"ВХІД НЕ РАНІШЕ: {entry_time(now):%H:%M:%S} "
+        "(аналіз і ручний вхід займають 10-40 с)"
+    )
+
+
+def prompt_matrix(now=None):
+    """Те, що йде в запит до моделі, залежно від MATRIX_MODE."""
+    return light_matrix(now) if MATRIX_MODE == "light" else full_matrix(now)
