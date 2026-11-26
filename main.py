@@ -56,7 +56,7 @@ MAX_IMAGES = _int_env("MAX_IMAGES", 5)  # скрінів в одній пачц�
 MAX_MODEL_IMAGES = _int_env("MAX_MODEL_IMAGES", 8)  # скільки останніх скрінів бачить модель
 ALBUM_WAIT = _float_env("ALBUM_WAIT", 3.0)  # чекаємо решту альбому
 SOLO_WAIT = _float_env("SOLO_WAIT", 1.5)  # чекаємо, чи не надішлють ще скрін поспіль
-MAX_NOW_REQUESTS = _int_env("MAX_NOW_REQUESTS", 1)  # скільки разів Nora може попросити скрін ЗАРАЗ
+MAX_NOW_REQUESTS = _int_env("MAX_NOW_REQUESTS", 2)  # скільки разів Nora може попросити скрін(и) ЗАРАЗ
 MAX_LATER_REQUESTS = _int_env("MAX_LATER_REQUESTS", 2)  # скільки разів може попросити ПІЗНІШЕ
 MAX_LATER_MINUTES = 60
 REMINDER_DELAY_SECONDS = _int_env("REMINDER_DELAY_SECONDS", 120)
@@ -263,11 +263,13 @@ async def apply_request(session, request, raw, round_no, bot):
     seen_text = " ".join(x for x in seen if x)
 
     if kind == "now":
+        many = "," in tf
         text = (
-            f"🔎 Потрібен ще один скрін ЗАРАЗ: {tf}.\n"
-            f"Навіщо: {request['reason']}\n"
+            (f"🔎 Потрібні ще скріни ЗАРАЗ: {tf}.\n" if many else f"🔎 Потрібен ще один скрін ЗАРАЗ: {tf}.\n")
+            + f"Навіщо: {request['reason']}\n"
             + (f"\n{seen_text}\n" if seen_text else "")
-            + "\nНадішли його одним повідомленням, я додам до цієї ж сесії."
+            + ("\nНадішли їх разом (альбомом), я додам до цієї ж сесії." if many
+               else "\nНадішли його одним повідомленням, я додам до цієї ж сесії.")
         )
     else:
         text = (
@@ -355,7 +357,7 @@ async def evaluate_session(session_id, bot):
 
         try:
             T0 = matrix.now_platform()  # від цього моменту рахуються вхід і експірація
-            matrix_text = matrix.full_matrix(T0)
+            matrix_text = matrix.prompt_matrix(T0)
             extra = None
             raw, verdict = "", {"type": "invalid", "why": "порожня відповідь"}
 
@@ -474,7 +476,7 @@ async def process_batch(messages, context):
             else:
                 session_id = memory.create_session(chat_id, user_id, captured_at)
                 memory.add_session_images(session_id, 0, images, matrix_text, captured_at)
-                text = f"📷 Початковий пакет: {len(images)} скрін(ів). Аналізую..."
+                text = f"📷 Отримала скрінів: {len(images)}. Аналізую..."
             if extra_count:
                 text += f"\n(Взяла перші {MAX_IMAGES}, ще {extra_count} пропущено.)"
             await status_message.edit_text(text)
@@ -538,8 +540,8 @@ def main_keyboard():
 async def start_work(update, context):
     memory.set_working(True)
     await update.effective_message.reply_text(
-        "🟢 Nora почала роботу.\nНадсилай початковий пакет скрінів (зазвичай H1, M15 і M3). "
-        "Решту я попрошу сама: зараз або пізніше, коли свічка сформується.",
+        "🟢 Nora почала роботу.\nНадсилай будь-які скріни: один чи кілька, будь-яких таймфреймів. "
+        "Чого не вистачає, я попрошу сама: зараз або пізніше, коли свічка сформується.",
         reply_markup=main_keyboard(),
     )
 
@@ -702,7 +704,7 @@ async def scheduler_loop(application):
                     text = f"⏰ Час глянути знову: {r['pair'] or 'графік'}.\nМинуле рішення: не вхід."
                     if r["note"]:
                         text += f"\nЩо мало з'явитися: {r['note']}"
-                    text += "\n\nНадішли свіжий пакет скрінів (H1, M15, M3), Nora подивиться ще раз."
+                    text += "\n\nНадішли свіжі скріни (які вважаєш потрібними), Nora подивиться ще раз."
                     await application.bot.send_message(r["chat_id"], text)
             await asyncio.sleep(SCHEDULER_INTERVAL_SECONDS)
         except asyncio.CancelledError:
@@ -731,7 +733,7 @@ def main():
     memory.init_db()
     logger.info(
         "Nora (%s). База: %s. Моделі: %s. Режим роботи: %s. Доступ: %s",
-        memory.VERSION, memory.DB_PATH, ", ".join(ai.MODELS), memory.is_working(),
+        memory.version_label(), memory.DB_PATH, ", ".join(ai.MODELS), memory.is_working(),
         f"{len(ALLOWED_USER_IDS)} id" if ALLOWED_USER_IDS else "відкрито для всіх",
     )
 
