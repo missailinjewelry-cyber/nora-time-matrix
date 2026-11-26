@@ -557,7 +557,7 @@ async def photo_handler(update, context):
 
 def main_keyboard():
     return ReplyKeyboardMarkup(
-        [["▶️ Почати роботу"], ["⏹ Скасувати стеження"], ["🌙 Завершити роботу"]],
+        [["▶️ Почати роботу"], ["🌙 Завершити роботу"]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -590,11 +590,10 @@ async def start_command(update, context):
         "Я Nora, аналітична система Матриці часу.\n"
         f"Поточний режим: {status}.\n\n"
         "▶️ Почати роботу: активувати аналіз.\n"
-        "⏹ Скасувати стеження: Nora більше не нагадує про цей графік, можна починати новий.\n"
         "🌙 Завершити роботу: скасувати незавершені сесії.\n\n"
         "/time: матриця часу зараз\n"
         "/stats: статистика\n"
-        "/cancel: те саме, що ⏹ Скасувати стеження\n"
+        "/cancel: скасувати поточний аналіз і нагадування\n"
         "/last: сира відповідь ШІ останнього прогнозу\n"
         "/id: твій Telegram id",
         reply_markup=main_keyboard(),
@@ -669,7 +668,7 @@ async def text_button_handler(update, context):
     text = (update.effective_message.text or "").strip()
     if text == "▶️ Почати роботу":
         await start_work(update, context)
-    elif text == "⏹ Скасувати стеження":
+    elif text == "⏹ Скасувати стеження":  # лише для старої клавіатури, що могла лишитись у чаті
         await update.effective_message.reply_text(cancel_report(update.effective_chat.id))
     elif text == "🌙 Завершити роботу":
         await stop_work(update, context)
